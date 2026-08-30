@@ -1,6 +1,6 @@
 # Import / Export .proto <-> Capella
 
-*[English version](README.en.md)*
+*[English version](README.md)*
 
 Outils en ligne de commande pour importer des services gRPC (fichiers
 `.proto`) dans un modèle Capella (Interfaces, Classes, Services,
@@ -48,6 +48,7 @@ uv pip freeze > requirements.txt     # puis : uv pip install -r requirements.txt
 | `export_capella_to_proto.py` | Exporte une Interface Capella vers un `.proto`. |
 | `verify_import.py` | Relit un modèle après import et affiche ce qui a été créé, pour vérification rapide. |
 | `list_datatypes.py` | Liste les `DataType` existants dans le `DataPkg` d'une couche, pour renseigner `proto_capella_types.py`. |
+| `setup_primitive_types.py` | Crée les 15 `DataType` primitifs manquants (`Int32`/`UInt64`/`String`/...) dans une couche, si absents. Idempotent. Utilisable seul, ou appelé automatiquement par l'import (§4). |
 | `route_guide.proto` | Fichier `.proto` d'exemple (officiel gRPC) pour tester : couvre les 4 modes de RPC (simple, streaming client/serveur/bidirectionnel) et des messages imbriqués. |
 
 Gardez tous les fichiers `.py` dans le même dossier : les scripts
@@ -59,13 +60,16 @@ s'importent mutuellement (`from proto_capella_types import ...`).
 ### Import : `.proto` → Capella
 
 ```bash
-python import_proto_to_capella.py mon_service.proto Mon_Modele.aird [--layer=la]
+python import_proto_to_capella.py mon_service.proto Mon_Modele.aird [--layer=la] [--strict-types]
 ```
 
 - `--layer` : couche cible, `oa` / `sa` / `la` (défaut) / `pa` — respectivement
   Operational Analysis, System Analysis, Logical Architecture, Physical
   Architecture. Pour des interfaces logicielles gRPC, `la` ou `pa` sont
   les choix pertinents (pas `oa`, qui sert au besoin métier).
+- `--strict-types` : n'auto-crée pas les `DataType` primitifs manquants ;
+  arrête l'import si l'un d'eux est absent, en listant précisément
+  lesquels (voir §4 — par défaut, ils sont auto-créés).
 - Le script crée : une `Class` par message, une `Property` par champ, une
   `Interface` par service, un `Service` (opération) par `rpc`, avec ses
   `Parameter` d'entrée/sortie typés.
@@ -73,9 +77,13 @@ python import_proto_to_capella.py mon_service.proto Mon_Modele.aird [--layer=la]
   sont repris dans la `description` Capella correspondante.
 - Le mode de streaming (`stream` sur la requête et/ou la réponse) est
   enregistré via PVMT (voir §5) sur l'opération.
+- **Idempotent** : relancer l'import sur le même `.proto`, ou une
+  version modifiée, ne duplique jamais les éléments déjà présents —
+  voir §7.
 - **Pré-requis dans le modèle**, dans la couche visée : un `DataPkg` et
   un `InterfacePkg` existants (créés par défaut par Capella), ainsi que
-  le domaine/groupe PVMT du streaming (§5).
+  le domaine/groupe PVMT du streaming (§5, toujours manuel — pas
+  d'auto-création possible pour PVMT, contrairement aux types §4).
 
 Après l'import : fermez et rouvrez le projet dans Capella (ou
 *Refresh*) pour voir les changements — le script modifie le fichier
@@ -103,25 +111,53 @@ python export_capella_to_proto.py Mon_Modele.aird NomDuService sortie.proto [--l
   depuis les `description` Capella.
 
 
-## 4. Réglage des types primitifs (une fois par projet)
+## 4. Réglage des types primitifs
 
-`proto_capella_types.py` contient le mapping entre types primitifs
-`.proto` (`string`, `int32`, `bool`...) et noms de `DataType` Capella
-(`String`, `Integer`, `Boolean`...). Ces noms dépendent de votre
-projet — vérifiez-les avec :
+`proto_capella_types.py` contient le mapping **bijectif** (1 type
+proto ↔ 1 type Capella) entre types primitifs `.proto` (`string`,
+`int32`, `uint64`, `sint32`...) et noms de `DataType` Capella
+(`String`, `Int32`, `UInt64`, `SInt32`...). Chaque largeur/signe a son
+propre type Capella — pas de fusion en un seul `Integer` générique,
+pour ne pas perdre d'information au round-trip.
 
-```bash
-python list_datatypes.py Mon_Modele.aird
+**Par défaut, les `DataType` primitifs manquants sont créés
+automatiquement à l'import**, dans le `DataPkg` de la couche ciblée
+(idempotent : ne duplique jamais un type déjà présent). Le script
+affiche ce qui a été créé :
+
+```
+INFO : DataTypes primitifs crees automatiquement : Int32, String
 ```
 
-Puis ajustez les valeurs dans `PROTO_TO_CAPELLA_PRIMITIVE` (dans
-`proto_capella_types.py`) pour qu'elles correspondent aux noms réels.
-Ce fichier est partagé par l'import et l'export : une seule
-modification suffit pour les deux sens.
+Pour trouver les types créés dans Capella : Project Explorer →
+`[votre couche]` → `Data` (le `DataPkg`) → vous y verrez `String`,
+`Boolean`, `Int32`, `Int64`, `UInt32`, `UInt64`, `SInt32`, `SInt64`,
+`Fixed32`, `Fixed64`, `SFixed32`, `SFixed64`, `Float`, `Double`,
+`Bytes` (au fur et à mesure qu'ils sont utilisés — pas forcément les
+15 d'un coup, seulement ceux réellement référencés par le `.proto`
+importé).
 
-Tant que ce n'est pas fait, les champs concernés sont créés/exportés
-**sans type résolu** (avertissement affiché à l'exécution, pas
-d'arrêt du script).
+Pour désactiver l'auto-création et forcer un contrôle strict (le
+script s'arrête si un type nécessaire manque, sans rien créer) :
+
+```bash
+python import_proto_to_capella.py mon_service.proto Mon_Modele.aird --strict-types
+```
+
+Vous pouvez aussi préparer un modèle à l'avance, sans lancer d'import,
+avec le script autonome :
+
+```bash
+python list_datatypes.py Mon_Modele.aird             # voir ce qui existe deja
+python setup_primitive_types.py Mon_Modele.aird --layer=la   # creer les 15 types
+```
+
+Si votre projet utilise déjà des types primitifs sous d'autres noms,
+inutile d'auto-créer : ajustez plutôt les valeurs dans
+`PROTO_TO_CAPELLA_PRIMITIVE` (dans `proto_capella_types.py`) pour
+qu'elles correspondent aux noms existants. Ce fichier est partagé par
+l'import et l'export : une seule modification suffit pour les deux
+sens.
 
 
 ## 5. Procédure PVMT (streaming gRPC) — à faire une fois par projet
@@ -178,7 +214,28 @@ sont ceux utilisés par défaut dans `proto_capella_types.py`
 utilisez d'autres noms, modifiez ces deux constantes en conséquence.
 
 
-## 6. Limites connues
+## 7. Ré-import : mise à jour vs duplication
+
+L'import est **idempotent**, par nom : relancer sur le même `.proto`
+(identique ou modifié) ne crée jamais de doublon. Pour chaque Class,
+Property, Interface, Service et Parameter, le script cherche d'abord
+un élément existant du même nom au même endroit ; s'il le trouve, il
+le met à jour (description, type) ; sinon il le crée.
+
+Ce que ça donne concrètement :
+
+| Situation | Comportement |
+|---|---|
+| Ré-import du même fichier | Aucune duplication, tout est simplement mis à jour. |
+| Version modifiée avec ajout (nouveau champ/méthode/message) | Le nouvel élément est ajouté aux existants. |
+| Version modifiée avec suppression | L'élément Capella devenu orphelin (absent du nouveau `.proto`) est **signalé** (`INFO : ... non supprimes`) mais **jamais supprimé automatiquement** — une suppression auto pourrait casser une référence ailleurs dans le modèle (un diagramme, par exemple). À vous de le retirer manuellement si besoin. |
+
+Le script signale aussi, à titre indicatif, les Classes du `DataPkg`
+qui ne sont pas du tout liées à ce `.proto` (contenu préexistant sans
+rapport) — normal si votre `DataPkg` contient d'autres éléments.
+
+
+## 8. Limites connues
 
 - **Fidélité `repeated`** : l'export détermine `repeated` à partir de
   la cardinalité (`max_card`) de la `Property` Capella. L'import
@@ -186,6 +243,7 @@ utilisez d'autres noms, modifiez ces deux constantes en conséquence.
   `repeated` importé puis ré-exporté ressortira donc comme simple. À
   corriger côté import si un round-trip fidèle sur les listes est
   nécessaire.
-- **Types primitifs et PVMT** : dépendent tous deux d'une configuration
-  propre à chaque projet Capella (§4 et §5), à faire une fois.
+- **Types primitifs et PVMT** : les types primitifs s'auto-créent
+  (§4) ; PVMT reste une configuration manuelle propre à chaque projet
+  Capella (§5), à faire une fois.
 - **`oneof`, `map<>`** : non gérés par les scripts actuels.

@@ -4,14 +4,22 @@ Import .proto -> Capella, via capellambse (pur Python 3, sans Capella
 ni Java lances).
 
 Usage :
-    python3 import_proto_to_capella.py mon_service.proto /chemin/vers/Model.aird [--layer=la]
+    python3 import_proto_to_capella.py mon_service.proto /chemin/vers/Model.aird [--layer=la] [--strict-types]
 
 --layer : oa (Operational Analysis) / sa (System Analysis) /
           la (Logical Architecture, defaut) / pa (Physical Architecture)
+--strict-types : n'auto-cree PAS les DataTypes primitifs manquants ;
+          arrete l'import si un type primitif necessaire n'existe pas
+          (comportement de secours pour les projets qui veulent
+          controler explicitement leurs DataTypes, sans creation
+          automatique meme discrete).
 
 Pre-requis modele Capella :
   - Un DataPkg et un InterfacePkg dans la couche choisie
   - Domaine/groupe PVMT deja defini pour le streaming (cf. check_pvmt_ready)
+  - Par defaut, les DataTypes primitifs manquants (String/Boolean/
+    Int32/... ) sont crees automatiquement au besoin (idempotent, ne
+    duplique jamais un type existant) -- desactivable avec --strict-types.
 """
 
 import sys
@@ -27,6 +35,7 @@ from proto_capella_types import (
     PVMT_CLIENT_STREAMING_KEY,
     PVMT_SERVER_STREAMING_KEY,
 )
+from setup_primitive_types import ensure_primitive_types
 
 
 # --------------------------------------------------------------------
@@ -138,9 +147,29 @@ def resolve_type(type_name, data_pkg, created_classes):
 def import_proto_model(proto_model, data_pkg, interface_pkg):
     created_classes = {}
 
-    # Messages -> Classes
+def _get_or_create(collection, name, typehint=None, **create_kwargs):
+    """Cherche un element par nom dans la collection ; le cree s'il
+    n'existe pas encore. Rend l'import IDEMPOTENT : relancer le script
+    sur le meme .proto (ou une version modifiee) met a jour les
+    elements existants au lieu de les dupliquer."""
+    try:
+        return collection.by_name(name), False  # (element, cree_maintenant)
+    except KeyError:
+        if typehint is not None:
+            return collection.create(typehint, name=name, **create_kwargs), True
+        return collection.create(name=name, **create_kwargs), True
+
+
+def import_proto_model(proto_model, data_pkg, interface_pkg):
+    created_classes = {}
+    stats = {"created": 0, "updated": 0}
+    proto_message_names = {m["name"] for m in proto_model["messages"]}
+    proto_service_names = {s["name"] for s in proto_model["services"]}
+
+    # Messages -> Classes (find-or-create par nom)
     for msg in proto_model["messages"]:
-        capella_class = data_pkg.classes.create(name=msg["name"])
+        capella_class, is_new = _get_or_create(data_pkg.classes, msg["name"])
+        stats["created" if is_new else "updated"] += 1
         if msg["comment"]:
             capella_class.description = msg["comment"]
         created_classes[msg["name"]] = capella_class
@@ -149,31 +178,56 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
     # existent (pour resoudre les references de type message a message)
     for msg in proto_model["messages"]:
         capella_class = created_classes[msg["name"]]
+        proto_field_names = {f["name"] for f in msg["fields"]}
+
         for field in msg["fields"]:
-            prop = capella_class.owned_properties.create(name=field["name"])
+            prop, _ = _get_or_create(capella_class.owned_properties, field["name"])
             if field["comment"]:
                 prop.description = field["comment"]
             field_type = resolve_type(field["type"], data_pkg, created_classes)
             if field_type is not None:
                 prop.type = field_type
 
+        # Champs presents dans Capella mais plus dans le .proto source :
+        # NON supprimes automatiquement (une suppression auto pourrait
+        # casser d'autres references dans le modele) -- juste signales,
+        # a vous de decider si vous les retirez a la main.
+        orphan_fields = [p.name for p in capella_class.owned_properties
+                          if p.name not in proto_field_names]
+        if orphan_fields:
+            print(f"INFO : Class '{msg['name']}' contient des champs absents "
+                  f"de ce .proto (non supprimes) : {', '.join(orphan_fields)}")
+
+    # Classes presentes dans Capella (ce DataPkg) mais absentes du .proto
+    orphan_classes = [c.name for c in data_pkg.classes
+                       if c.name not in proto_message_names and c.name not in created_classes]
+    # (orphan_classes n'est qu'indicatif si le DataPkg contient d'autres
+    # classes non liees a cet import -- a affiner si vous importez
+    # plusieurs .proto dans le meme DataPkg)
+
     # Services -> Interfaces, rpc -> Service (Operation), params
     for svc in proto_model["services"]:
-        capella_interface = interface_pkg.interfaces.create(name=svc["name"])
+        capella_interface, is_new = _get_or_create(interface_pkg.interfaces, svc["name"])
+        stats["created" if is_new else "updated"] += 1
         if svc["comment"]:
             capella_interface.description = svc["comment"]
 
+        proto_method_names = {m["name"] for m in svc["methods"]}
+
         for method in svc["methods"]:
-            operation = capella_interface.owned_features.create("Service", name=method["name"])
+            operation, op_is_new = _get_or_create(
+                capella_interface.owned_features, method["name"], typehint="Service")
             if method["comment"]:
                 operation.description = method["comment"]
 
             in_type = resolve_type(method["input_type"], data_pkg, created_classes)
             out_type = resolve_type(method["output_type"], data_pkg, created_classes)
+            in_param, _ = _get_or_create(operation.parameters, "request", direction="IN")
+            out_param, _ = _get_or_create(operation.parameters, "response", direction="OUT")
             if in_type is not None:
-                operation.parameters.create(name="request", direction="IN", type=in_type)
+                in_param.type = in_type
             if out_type is not None:
-                operation.parameters.create(name="response", direction="OUT", type=out_type)
+                out_param.type = out_type
 
             # Streaming -> PVMT (necessite que le domaine/groupe existe deja)
             try:
@@ -184,6 +238,20 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
                       "streaming non renseigne pour '%s'." %
                       (PVMT_CLIENT_STREAMING_KEY, method["name"]))
 
+        # Operations presentes dans Capella mais plus dans le .proto :
+        # signalees, non supprimees (meme logique que pour les champs).
+        orphan_methods = [f.name for f in capella_interface.owned_features
+                           if type(f).__name__ == "Service" and f.name not in proto_method_names]
+        if orphan_methods:
+            print(f"INFO : Interface '{svc['name']}' contient des operations absentes "
+                  f"de ce .proto (non supprimees) : {', '.join(orphan_methods)}")
+
+    if orphan_classes:
+        print(f"INFO : le DataPkg contient d'autres Classes non references "
+              f"par ce .proto : {', '.join(orphan_classes)}")
+
+    print(f"Bilan : {stats['created']} element(s) cree(s), "
+          f"{stats['updated']} element(s) deja existant(s) mis a jour.")
     return created_classes
 
 
@@ -231,6 +299,41 @@ def get_layer(model, layer_code):
     return getattr(model, layer_code)
 
 
+def referenced_primitive_capella_names(proto_model):
+    """Noms Capella des types primitifs reellement references par les
+    champs de ce .proto (les types message/enum ne sont pas concernes,
+    ils deviennent des Classes creees par l'import lui-meme)."""
+    names = set()
+    for msg in proto_model["messages"]:
+        for field in msg["fields"]:
+            if field["type"] in PROTO_TO_CAPELLA_PRIMITIVE:
+                names.add(PROTO_TO_CAPELLA_PRIMITIVE[field["type"]])
+    return names
+
+
+def check_types_ready(data_pkg, proto_model):
+    """Mode --strict-types : n'auto-cree rien, arrete l'import si un
+    type primitif necessaire manque."""
+    needed = referenced_primitive_capella_names(proto_model)
+    missing = []
+    for name in sorted(needed):
+        try:
+            data_pkg.data_types.by_name(name)
+        except KeyError:
+            missing.append(name)
+    if missing:
+        print(f"""
+ARRET (--strict-types) : les DataTypes primitifs suivants sont requis
+par ce .proto mais absents du DataPkg : {', '.join(missing)}
+
+Lancez 'python setup_primitive_types.py {{Model.aird}} --layer=...'
+pour les creer, ou retirez --strict-types pour laisser l'import les
+creer automatiquement.
+""")
+        return False
+    return True
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Import .proto -> Capella")
     parser.add_argument("proto_file", help="Fichier .proto a importer")
@@ -238,6 +341,10 @@ if __name__ == "__main__":
     parser.add_argument("--layer", default="la", choices=list(LAYER_CHOICES),
                          help="Couche d'architecture cible (defaut: la = Logical Architecture). "
                               "Choix : " + ", ".join(f"{k}={v}" for k, v in LAYER_CHOICES.items()))
+    parser.add_argument("--strict-types", action="store_true",
+                         help="N'auto-cree pas les DataTypes primitifs manquants ; "
+                              "arrete l'import si l'un d'eux est absent (defaut : "
+                              "auto-creation idempotente, avec message informatif).")
     args = parser.parse_args()
 
     proto_model = parse_proto_file(args.proto_file)
@@ -249,6 +356,15 @@ if __name__ == "__main__":
     layer = get_layer(model, args.layer)
     data_pkg = layer.data_pkg
     interface_pkg = layer.interface_pkg
+
+    if args.strict_types:
+        if not check_types_ready(data_pkg, proto_model):
+            sys.exit(1)
+    else:
+        types_created, types_existing = ensure_primitive_types(data_pkg)
+        if types_created:
+            print(f"INFO : DataTypes primitifs crees automatiquement : "
+                  f"{', '.join(types_created)}")
 
     created = import_proto_model(proto_model, data_pkg, interface_pkg)
     model.save()
