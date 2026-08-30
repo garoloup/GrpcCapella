@@ -84,22 +84,15 @@ def parse_proto_file(proto_path):
 
 # --------------------------------------------------------------------
 # 2. Resolution des types primitifs proto -> DataType Capella existant
-#    A COMPLETER selon les DataTypes reellement presents dans votre
-#    DataPkg (verifiez avec data_pkg.data_types dans une session
-#    interactive avant de lancer l'import en masse).
+#    Le mapping vit desormais dans proto_capella_types.py (partage
+#    avec le script d'export) -- modifiez-le LA-BAS, pas ici.
 # --------------------------------------------------------------------
 
-PROTO_TO_CAPELLA_PRIMITIVE = {
-    "string": "String",
-    "bool": "Boolean",
-    "int32": "Integer",
-    "int64": "Integer",
-    "uint32": "Integer",
-    "uint64": "Integer",
-    "float": "Float",
-    "double": "Float",
-    "bytes": "String",
-}
+from proto_capella_types import (
+    PROTO_TO_CAPELLA_PRIMITIVE,
+    PVMT_CLIENT_STREAMING_KEY,
+    PVMT_SERVER_STREAMING_KEY,
+)
 
 
 def resolve_type(type_name, data_pkg, created_classes):
@@ -121,10 +114,6 @@ def resolve_type(type_name, data_pkg, created_classes):
 # 3. Creation des elements Capella
 # --------------------------------------------------------------------
 
-# Adapter ces noms au domaine/groupe PVMT reellement defini dans votre
-# projet pour le streaming gRPC (cf. onglet PVMT de Capella).
-PVMT_CLIENT_STREAMING_KEY = "Grpc.Streaming.ClientStreaming"
-PVMT_SERVER_STREAMING_KEY = "Grpc.Streaming.ServerStreaming"
 
 
 def import_proto_model(proto_model, data_pkg, interface_pkg):
@@ -175,6 +164,41 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
 # 4. Point d'entree
 # --------------------------------------------------------------------
 
+def check_pvmt_ready(model):
+    """
+    Controle prealable, en debut de script : si le domaine/groupe PVMT
+    pour le streaming n'existe pas, on arrete tout de suite avec des
+    instructions claires, plutot que de laisser tourner un import a
+    moitie renseigne (silencieusement, warning par warning).
+
+    NB : capellambse ne permet PAS de creer un domaine/groupe PVMT par
+    script (NotImplementedError: "Cannot mutate lists with 'alternate'
+    set") -- c'est une restriction volontaire de la bibliotheque. La
+    creation reste donc une etape manuelle, unique, a faire dans
+    Capella (cf. instructions affichees ci-dessous).
+    """
+    domain_name, group_name = PVMT_CLIENT_STREAMING_KEY.split(".")[0:2]
+    try:
+        domain = model.pvmt.domains.by_name(domain_name)
+        domain.groups.by_name(group_name)
+        return True
+    except KeyError:
+        print(f"""
+ARRET : le domaine/groupe PVMT '{domain_name}.{group_name}' n'existe pas
+encore dans ce modele. Les flags de streaming gRPC ne pourront pas etre
+enregistres tant qu'il n'est pas cree.
+
+A faire UNE FOIS dans Capella (PV Definition Editor) :
+  1. Domain          : {domain_name}
+  2. Group            : {group_name}
+  3. Properties (Boolean) : ClientStreaming, ServerStreaming
+  4. Scope : applicable aux elements de type Operation
+
+Relancez ce script une fois cette structure creee.
+""")
+        return False
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python3 import_proto_to_capella.py <fichier.proto> <Model.aird>")
@@ -184,6 +208,9 @@ if __name__ == "__main__":
 
     proto_model = parse_proto_file(proto_path)
     model = capellambse.MelodyModel(model_path)
+
+    if not check_pvmt_ready(model):
+        sys.exit(1)
 
     # A adapter : selection du DataPkg / InterfacePkg cibles dans VOTRE
     # projet. Capella cree un DataPkg "Data" dans CHAQUE couche (OA, SA,
