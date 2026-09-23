@@ -65,9 +65,31 @@ NUMERIC_TYPE_RANGES = {
     "Double":   ("FLOAT", None, None),
 }
 
-# PVMT : idem, un seul endroit a corriger pour les deux sens.
-PVMT_CLIENT_STREAMING_KEY = "Grpc.Streaming.ClientStreaming"
-PVMT_SERVER_STREAMING_KEY = "Grpc.Streaming.ServerStreaming"
+# PVMT streaming : UNE seule propriete d'enumeration (pas deux
+# booleens) -- Domain "Grpc", groupe "GrpcMethod", propriete
+# "streaming_mode" de type "grpc_streaming_mode" (4 litteraux definis
+# dans le domaine lui-meme). Remplace l'ancien design a 2 booleens
+# (Grpc.Streaming.ClientStreaming/ServerStreaming), redondant avec
+# celui-ci -- gardez UNE SEULE des deux structures dans votre PVMT
+# Capella, pas les deux (cf. discussion : meme information encodee
+# deux fois = risque de divergence).
+PVMT_STREAMING_DOMAIN = "Grpc"
+PVMT_STREAMING_GROUP = "GrpcMethod"
+PVMT_STREAMING_PROPERTY = "streaming_mode"
+PVMT_STREAMING_MODE_KEY = f"{PVMT_STREAMING_DOMAIN}.{PVMT_STREAMING_GROUP}.{PVMT_STREAMING_PROPERTY}"
+PVMT_STREAMING_ENUM_TYPE = "grpc_streaming_mode"
+
+# (client_streaming, server_streaming) -> nom du litteral Capella, et
+# son inverse -- doivent correspondre EXACTEMENT aux 4 litteraux definis
+# dans votre Domain PVMT (cf. capture d'ecran : UNARY, CLIENT_STREAMING,
+# SERVER_STREAMING, BIDIR_STREAMING).
+STREAMING_FLAGS_TO_MODE = {
+    (False, False): "UNARY",
+    (True, False): "CLIENT_STREAMING",
+    (False, True): "SERVER_STREAMING",
+    (True, True): "BIDIR_STREAMING",
+}
+STREAMING_MODE_TO_FLAGS = {v: k for k, v in STREAMING_FLAGS_TO_MODE.items()}
 
 # PVMT optionnel (String) pour stocker le "package" .proto d'origine sur
 # l'Interface -- contrairement au streaming, ABSENT n'empeche PAS

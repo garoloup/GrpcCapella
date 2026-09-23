@@ -38,8 +38,8 @@ import capellambse
 
 from proto_capella_types import (
     CAPELLA_TO_PROTO_PRIMITIVE,
-    PVMT_CLIENT_STREAMING_KEY,
-    PVMT_SERVER_STREAMING_KEY,
+    PVMT_STREAMING_MODE_KEY,
+    STREAMING_MODE_TO_FLAGS,
     PVMT_PACKAGE_KEY,
 )
 
@@ -136,8 +136,9 @@ def interface_to_proto_service(interface, uses_empty):
                 uses_empty.add(True)
 
         try:
-            client_streaming = bool(op.pvmt[PVMT_CLIENT_STREAMING_KEY])
-            server_streaming = bool(op.pvmt[PVMT_SERVER_STREAMING_KEY])
+            mode_literal = op.pvmt[PVMT_STREAMING_MODE_KEY]
+            client_streaming, server_streaming = STREAMING_MODE_TO_FLAGS.get(
+                mode_literal.name, (False, False))
         except KeyError:
             client_streaming = server_streaming = False
 

@@ -32,8 +32,12 @@ import os
 
 from proto_capella_types import (
     PROTO_TO_CAPELLA_PRIMITIVE,
-    PVMT_CLIENT_STREAMING_KEY,
-    PVMT_SERVER_STREAMING_KEY,
+    PVMT_STREAMING_MODE_KEY,
+    PVMT_STREAMING_DOMAIN,
+    PVMT_STREAMING_GROUP,
+    PVMT_STREAMING_PROPERTY,
+    PVMT_STREAMING_ENUM_TYPE,
+    STREAMING_FLAGS_TO_MODE,
     PVMT_PACKAGE_KEY,
 )
 from setup_primitive_types import ensure_primitive_types
@@ -187,6 +191,16 @@ def resolve_type(type_name, data_pkg, created_classes, created_enums=None):
         return None
 
 
+def get_streaming_mode_literal(model, mode_name):
+    """Recupere l'objet EnumerationPropertyLiteral pour un nom de mode
+    (ex: 'BIDIR_STREAMING') -- une propriete PVMT d'enumeration exige
+    l'OBJET litteral reel a l'affectation, pas une simple chaine (verifie
+    par test direct : assigner une str leve InvalidModificationError)."""
+    domain = model.pvmt.domains.by_name(PVMT_STREAMING_DOMAIN)
+    enum_type = domain.enumeration_property_types.by_name(PVMT_STREAMING_ENUM_TYPE)
+    return enum_type.literals.by_name(mode_name)
+
+
 # --------------------------------------------------------------------
 # 3. Creation des elements Capella
 # --------------------------------------------------------------------
@@ -204,7 +218,7 @@ def _get_or_create(collection, name, typehint=None, **create_kwargs):
         return collection.create(name=name, **create_kwargs), True
 
 
-def import_proto_model(proto_model, data_pkg, interface_pkg):
+def import_proto_model(proto_model, data_pkg, interface_pkg, model):
     created_classes = {}
     created_enums = {}
     stats = {"created": 0, "updated": 0}
@@ -322,14 +336,16 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
                 if out_type is not None:
                     out_param.type = out_type
 
-            # Streaming -> PVMT (necessite que le domaine/groupe existe deja)
+            # Streaming -> PVMT, une seule propriete d'enumeration
+            # (necessite que le domaine/groupe/type existent deja)
+            mode_name = STREAMING_FLAGS_TO_MODE[(method["client_streaming"], method["server_streaming"])]
             try:
-                operation.pvmt[PVMT_CLIENT_STREAMING_KEY] = method["client_streaming"]
-                operation.pvmt[PVMT_SERVER_STREAMING_KEY] = method["server_streaming"]
+                literal = get_streaming_mode_literal(model, mode_name)
+                operation.pvmt[PVMT_STREAMING_MODE_KEY] = literal
             except KeyError:
-                print("ATTENTION : domaine/groupe PVMT '%s' introuvable, "
-                      "streaming non renseigne pour '%s'." %
-                      (PVMT_CLIENT_STREAMING_KEY, method["name"]))
+                print("ATTENTION : domaine/groupe/enumeration PVMT '%s' introuvable "
+                      "(ou litteral '%s' absent), streaming non renseigne pour '%s'." %
+                      (PVMT_STREAMING_MODE_KEY, mode_name, method["name"]))
 
         # Operations presentes dans Capella mais plus dans le .proto :
         # signalees, non supprimees (meme logique que pour les champs).
@@ -364,26 +380,30 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
 
 def check_pvmt_ready(model):
     """
-    Controle prealable : si le domaine/groupe PVMT n'existe pas, on
-    arrete tout de suite avec des instructions claires. capellambse ne
-    permet pas de le creer par script (limite volontaire de la lib).
+    Controle prealable : si le domaine/groupe/type d'enumeration PVMT
+    n'existe pas, on arrete tout de suite avec des instructions claires.
+    capellambse ne permet pas de le creer par script (limite volontaire
+    de la lib).
     """
-    domain_name, group_name = PVMT_CLIENT_STREAMING_KEY.split(".")[0:2]
     try:
-        domain = model.pvmt.domains.by_name(domain_name)
-        domain.groups.by_name(group_name)
+        domain = model.pvmt.domains.by_name(PVMT_STREAMING_DOMAIN)
+        domain.groups.by_name(PVMT_STREAMING_GROUP)
+        domain.enumeration_property_types.by_name(PVMT_STREAMING_ENUM_TYPE)
         return True
     except KeyError:
         print(f"""
-ARRET : le domaine/groupe PVMT '{domain_name}.{group_name}' n'existe pas
-encore dans ce modele. Les flags de streaming gRPC ne pourront pas etre
-enregistres tant qu'il n'est pas cree.
+ARRET : la structure PVMT '{PVMT_STREAMING_MODE_KEY}' n'existe pas encore
+dans ce modele. Le mode de streaming gRPC ne pourra pas etre enregistre
+tant qu'elle n'est pas creee.
 
 A faire UNE FOIS dans Capella (PV Definition Editor) :
-  1. Domain          : {domain_name}
-  2. Group            : {group_name}
-  3. Properties (Boolean) : ClientStreaming, ServerStreaming
-  4. Scope : couche(s) ou vivent vos interfaces (Logical/Physical...)
+  1. Domain                : {PVMT_STREAMING_DOMAIN}
+  2. Enumeration type       : {PVMT_STREAMING_ENUM_TYPE}, avec 4 litteraux :
+                              UNARY, CLIENT_STREAMING, SERVER_STREAMING,
+                              BIDIR_STREAMING
+  3. Group                  : {PVMT_STREAMING_GROUP}
+  4. Property (dans le Group), type {PVMT_STREAMING_ENUM_TYPE} : {PVMT_STREAMING_PROPERTY}
+  5. Scope : couche(s) ou vivent vos interfaces (Logical/Physical...)
 
 Relancez ce script une fois cette structure creee.
 """)
@@ -469,7 +489,7 @@ if __name__ == "__main__":
             print(f"INFO : DataTypes primitifs crees automatiquement : "
                   f"{', '.join(types_created)}")
 
-    created = import_proto_model(proto_model, data_pkg, interface_pkg)
+    created = import_proto_model(proto_model, data_pkg, interface_pkg, model)
     model.save()
     print("Import termine dans %s : %d classes, %d services crees." %
           (LAYER_CHOICES[args.layer], len(created), len(proto_model["services"])))
