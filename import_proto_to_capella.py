@@ -95,15 +95,20 @@ def _build_comment_index(file_proto):
 
 def _extract_header_comment(file_proto):
     """
-    Le cartouche d'en-tete (licence/copyright) est un bloc de
-    commentaires SEPARE de 'syntax = ...;' par une ligne vide -- ce
-    qui en fait un commentaire "detache" (leading_detached_comments),
-    pas un leading_comments normal. Rattache au champ "syntax" de
-    FileDescriptorProto, path [12] (verifie par test direct sur un
-    fichier .proto reel avec licence Apache en tete)."""
+    Le cartouche d'en-tete (licence/copyright) est rattache au champ
+    "syntax" de FileDescriptorProto (path [12]), sous deux formes
+    possibles selon qu'il y a une ligne vide avant 'syntax = ...;' :
+      - PAS de ligne vide (ex: '// Counter interface' juste au-dessus)
+        -> leading_comments normal.
+      - Ligne vide separatrice (ex: licence Apache multi-lignes)
+        -> leading_detached_comments ("detache").
+    Les deux cas verifies par test direct."""
     for loc in file_proto.source_code_info.location:
-        if list(loc.path) == [12] and loc.leading_detached_comments:
-            return "\n\n".join(c.strip() for c in loc.leading_detached_comments).strip()
+        if list(loc.path) == [12]:
+            if loc.leading_comments:
+                return loc.leading_comments.strip()
+            if loc.leading_detached_comments:
+                return "\n\n".join(c.strip() for c in loc.leading_detached_comments).strip()
     return ""
 
 

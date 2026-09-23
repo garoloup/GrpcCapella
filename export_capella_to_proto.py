@@ -223,9 +223,14 @@ def interface_to_proto_service(interface, needed_imports):
     ecrire)."""
     lines = _as_comment_lines(interface.description)
     lines.append(f"service {interface.name} {{")
+    first_method = True
     for op in interface.owned_features:
         if type(op).__name__ != "Service":
             continue  # ignore les autres types de Feature eventuels
+
+        if not first_method:
+            lines.append("")  # ligne vide entre chaque methode, comme dans un .proto ecrit a la main
+        first_method = False
 
         in_param = next((p for p in op.parameters if str(p.direction) == "IN"), None)
         out_param = next((p for p in op.parameters if str(p.direction) == "OUT"), None)
