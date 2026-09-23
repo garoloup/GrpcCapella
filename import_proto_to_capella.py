@@ -1,25 +1,32 @@
 # -*- coding: utf-8 -*-
 """
 Import .proto -> Capella, via capellambse (pur Python 3, sans Capella
-ni Java lances).
+ni Java lances). Traite le fichier cible ET tous ses imports transitifs
+(y compris les well-known types Google), en organisant les Classes/
+Enumerations/Interfaces dans des sous-packages Capella qui reproduisent
+l'arborescence de DOSSIERS de vos fichiers .proto (pas le nom de
+fichier individuel : deux .proto dans le meme dossier partagent le
+meme package Capella).
 
 Usage :
-    python3 import_proto_to_capella.py mon_service.proto /chemin/vers/Model.aird [--layer=la] [--strict-types]
+    python3 import_proto_to_capella.py mon_service.proto /chemin/vers/Model.aird [--layer=la] [--proto-root=DOSSIER] [--strict-types]
 
 --layer : oa (Operational Analysis) / sa (System Analysis) /
           la (Logical Architecture, defaut) / pa (Physical Architecture)
+--proto-root : dossier racine pour resoudre vos "import" relatifs
+          imbriques (ex: import "service_base_api/ServiceB.proto").
+          Sans lui, seul le dossier direct du fichier cible est
+          utilisable -- OK pour un fichier isole, insuffisant sinon.
 --strict-types : n'auto-cree PAS les DataTypes primitifs manquants ;
-          arrete l'import si un type primitif necessaire n'existe pas
-          (comportement de secours pour les projets qui veulent
-          controler explicitement leurs DataTypes, sans creation
-          automatique meme discrete).
+          arrete l'import si un type primitif necessaire n'existe pas.
 
 Pre-requis modele Capella :
-  - Un DataPkg et un InterfacePkg dans la couche choisie
-  - Domaine/groupe PVMT deja defini pour le streaming (cf. check_pvmt_ready)
-  - Par defaut, les DataTypes primitifs manquants (String/Boolean/
-    Int32/... ) sont crees automatiquement au besoin (idempotent, ne
-    duplique jamais un type existant) -- desactivable avec --strict-types.
+  - Un DataPkg et un InterfacePkg dans la couche choisie (racine sous
+    laquelle les sous-packages par dossier sont crees automatiquement)
+  - Domaine/groupe/type d'enumeration PVMT deja defini pour le
+    streaming (cf. check_pvmt_ready)
+  - Par defaut, les DataTypes primitifs manquants sont crees
+    automatiquement au besoin -- desactivable avec --strict-types.
 """
 
 import sys
@@ -39,25 +46,28 @@ from proto_capella_types import (
     PVMT_STREAMING_ENUM_TYPE,
     STREAMING_FLAGS_TO_MODE,
     PVMT_PACKAGE_KEY,
+    PVMT_SOURCE_FILE_KEY,
 )
 from setup_primitive_types import ensure_primitive_types
 
 
 # --------------------------------------------------------------------
-# 1. Parsing du .proto, avec extraction des commentaires (SourceCodeInfo)
+# 1. Parsing du/des .proto, multi-fichiers (le fichier cible + tous ses
+#    imports transitifs, y compris les "well-known types" Google), avec
+#    extraction des commentaires (SourceCodeInfo)
 # --------------------------------------------------------------------
 
-def _field_type_name(field):
+def _field_type_ref(field):
+    """Reference de type d'un champ : nom qualifie complet pour un
+    message/enum (ex: '.service_base_api.Y', utilise comme cle globale
+    de resolution inter-fichiers), ou mot-cle primitif proto (ex:
+    'int32') sinon."""
     if field.type in (
         descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
         descriptor_pb2.FieldDescriptorProto.TYPE_ENUM,
     ):
-        return field.type_name.split(".")[-1]
+        return field.type_name  # deja qualifie complet, ex: ".pkg.Type"
     return descriptor_pb2.FieldDescriptorProto.Type.Name(field.type).replace("TYPE_", "").lower()
-
-
-def _short_type(full_name):
-    return full_name.split(".")[-1] if full_name else full_name
 
 
 def _build_comment_index(file_proto):
@@ -66,6 +76,8 @@ def _build_comment_index(file_proto):
     SourceCodeInfo. Encodage des chemins (cf. descriptor.proto) :
       [4, i]       -> message_type[i]           (le message lui-meme)
       [4, i, 2, j]  -> message_type[i].field[j]   (un champ)
+      [5, i]       -> enum_type[i]                (l'enum lui-meme)
+      [5, i, 2, j]  -> enum_type[i].value[j]       (une valeur)
       [6, i]       -> service[i]                 (le service lui-meme)
       [6, i, 2, j]  -> service[i].method[j]        (une methode/rpc)
     """
@@ -80,28 +92,36 @@ def _build_comment_index(file_proto):
 import grpc_tools
 
 
-EMPTY_TYPE_FULL_NAME = ".google.protobuf.Empty"
-
-
-def _is_empty(full_type_name):
-    return full_type_name == EMPTY_TYPE_FULL_NAME
-
-
-def parse_proto_file(proto_path, extra_include_dirs=None):
+def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
     """
-    extra_include_dirs : repertoires -I supplementaires, pour resoudre
-    les "import" d'autres .proto (vos propres fichiers partages, par
-    exemple). Les "well-known types" Google (google/protobuf/empty.proto,
-    timestamp.proto, etc.) sont TOUJOURS inclus automatiquement, via le
-    dossier embarque par grpcio-tools -- inutile de les fournir.
+    Parse le fichier .proto cible ET tous ses imports transitifs (y
+    compris les "well-known types" Google : google/protobuf/empty.proto,
+    timestamp.proto, etc. -- inclus automatiquement, sans rien a fournir).
+
+    proto_root : le repertoire racine par rapport auquel vos "import"
+    relatifs se resolvent (ex: si votre .proto fait
+    `import "service_base_api/ServiceB.proto";`, proto_root doit etre
+    le dossier qui CONTIENT "service_base_api/"). Sans lui, seul le
+    dossier direct du fichier cible est utilise -- suffisant pour un
+    fichier isole, mais PAS pour des imports en chemin relatif imbrique.
+
+    extra_include_dirs : repertoires -I supplementaires additionnels.
+
+    Retourne {"files": [ {path, folder, package, messages, enums,
+    services}, ... ]}, un element par fichier reellement compile (cible
+    + imports transitifs), dans l'ordre topologique de protoc
+    (dependances avant leurs dependants).
     """
     proto_path = os.path.abspath(proto_path)
-    include_dir = os.path.dirname(proto_path)
     well_known_types_dir = os.path.join(os.path.dirname(grpc_tools.__file__), "_proto")
 
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "descriptor.pb")
-        args = ["protoc", "-I" + include_dir, "-I" + well_known_types_dir]
+        args = ["protoc"]
+        if proto_root:
+            args.append("-I" + os.path.abspath(proto_root))
+        args.append("-I" + os.path.dirname(proto_path))  # repli pour fichier isole
+        args.append("-I" + well_known_types_dir)
         for extra_dir in (extra_include_dirs or []):
             args.append("-I" + os.path.abspath(extra_dir))
         args += ["--include_imports", "--include_source_info",
@@ -113,81 +133,103 @@ def parse_proto_file(proto_path, extra_include_dirs=None):
         with open(out_path, "rb") as f:
             fds.ParseFromString(f.read())
 
-    file_proto = fds.file[-1]  # le fichier demande (les imports sont avant)
-    comments = _build_comment_index(file_proto)
-    model = {"package": file_proto.package or None, "messages": [], "enums": [], "services": []}
+    files = []
+    for file_proto in fds.file:
+        comments = _build_comment_index(file_proto)
+        folder = os.path.dirname(file_proto.name)  # ex: "service_base_api", "google/protobuf", ou "" (racine)
 
-    for i, msg in enumerate(file_proto.message_type):
-        fields = []
-        for j, f in enumerate(msg.field):
-            fields.append({
-                "name": f.name, "number": f.number, "type": _field_type_name(f),
-                "repeated": f.label == descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
-                "comment": comments.get((4, i, 2, j), ""),
+        messages = []
+        for i, msg in enumerate(file_proto.message_type):
+            fields = []
+            for j, f in enumerate(msg.field):
+                fields.append({
+                    "name": f.name, "number": f.number, "type": _field_type_ref(f),
+                    "repeated": f.label == descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+                    "comment": comments.get((4, i, 2, j), ""),
+                })
+            messages.append({
+                "name": msg.name,
+                "qualified_name": f".{file_proto.package}.{msg.name}" if file_proto.package else f".{msg.name}",
+                "fields": fields,
+                "comment": comments.get((4, i), ""),
             })
-        model["messages"].append({
-            "name": msg.name, "fields": fields,
-            "comment": comments.get((4, i), ""),
+
+        # Enums de premier niveau seulement (pas les enums imbriques
+        # dans un message -- limite connue, cf. README).
+        enums = []
+        for i, en in enumerate(file_proto.enum_type):
+            values = []
+            for j, v in enumerate(en.value):
+                values.append({
+                    "name": v.name, "number": v.number,
+                    "comment": comments.get((5, i, 2, j), ""),
+                })
+            enums.append({
+                "name": en.name,
+                "qualified_name": f".{file_proto.package}.{en.name}" if file_proto.package else f".{en.name}",
+                "values": values,
+                "comment": comments.get((5, i), ""),
+            })
+
+        services = []
+        for i, svc in enumerate(file_proto.service):
+            methods = []
+            for j, m in enumerate(svc.method):
+                methods.append({
+                    "name": m.name,
+                    "input_type": m.input_type,   # deja qualifie complet
+                    "output_type": m.output_type,  # idem
+                    "client_streaming": bool(m.client_streaming),
+                    "server_streaming": bool(m.server_streaming),
+                    "comment": comments.get((6, i, 2, j), ""),
+                })
+            services.append({
+                "name": svc.name, "methods": methods,
+                "comment": comments.get((6, i), ""),
+            })
+
+        files.append({
+            "path": file_proto.name,
+            "folder": folder,
+            "package": file_proto.package or None,
+            "messages": messages,
+            "enums": enums,
+            "services": services,
         })
 
-    # Enums de premier niveau (path [5, i] / valeurs [5, i, 2, j] --
-    # cf. descriptor.proto : FileDescriptorProto.enum_type = champ 5).
-    # NB : les enums IMBRIQUES dans un message (nested) ne sont pas geres
-    # ici, seulement les enums declares au niveau du fichier -- limite
-    # connue, cf. README.
-    for i, en in enumerate(file_proto.enum_type):
-        values = []
-        for j, v in enumerate(en.value):
-            values.append({
-                "name": v.name, "number": v.number,
-                "comment": comments.get((5, i, 2, j), ""),
-            })
-        model["enums"].append({
-            "name": en.name, "values": values,
-            "comment": comments.get((5, i), ""),
-        })
-
-    for i, svc in enumerate(file_proto.service):
-        methods = []
-        for j, m in enumerate(svc.method):
-            methods.append({
-                "name": m.name,
-                "input_type": _short_type(m.input_type),
-                "output_type": _short_type(m.output_type),
-                "input_is_empty": _is_empty(m.input_type),
-                "output_is_empty": _is_empty(m.output_type),
-                "client_streaming": bool(m.client_streaming),
-                "server_streaming": bool(m.server_streaming),
-                "comment": comments.get((6, i, 2, j), ""),
-            })
-        model["services"].append({
-            "name": svc.name, "methods": methods,
-            "comment": comments.get((6, i), ""),
-        })
-
-
-    return model
+    return {"files": files}
 
 
 # --------------------------------------------------------------------
-# 2. Resolution des types primitifs proto -> DataType Capella existant
+# 2. Resolution des types : primitifs proto -> DataType Capella, et
+#    types message/enum -> Class/Enumeration deja creees (n'importe
+#    quel fichier, cf. registre global "created_types" indexe par nom
+#    qualifie complet)
 # --------------------------------------------------------------------
 
-def resolve_type(type_name, data_pkg, created_classes, created_enums=None):
-    """Cherche d'abord parmi les Classes/Enumerations qu'on vient de
-    creer (types message/enum de ce .proto), sinon parmi les DataTypes
-    primitifs existants du DataPkg."""
-    if type_name in created_classes:
-        return created_classes[type_name]
-    if created_enums and type_name in created_enums:
-        return created_enums[type_name]
-    capella_name = PROTO_TO_CAPELLA_PRIMITIVE.get(type_name, type_name)
+def resolve_type(type_ref, root_data_pkg, created_types):
+    """type_ref : soit un mot-cle primitif ('int32', 'string'...), soit
+    un nom de type qualifie complet ('.pkg.Message') -- distingue les
+    deux par la presence d'un '.' initial (convention protoc).
+    root_data_pkg : le DataPkg RACINE de la couche (pas le sous-package
+    par dossier) -- les DataTypes primitifs (String, Int32...) sont
+    toujours crees/cherches a la racine, partages entre tous les
+    modules proto, jamais dupliques par sous-package."""
+    if type_ref.startswith("."):
+        capella_type = created_types.get(type_ref)
+        if capella_type is not None:
+            return capella_type
+        print("ATTENTION : type '%s' introuvable dans le registre global "
+              "(message/enum non cree ?) : le champ/parametre restera "
+              "sans type." % type_ref)
+        return None
+    capella_name = PROTO_TO_CAPELLA_PRIMITIVE.get(type_ref, type_ref)
     try:
-        return data_pkg.data_types.by_name(capella_name)
+        return root_data_pkg.data_types.by_name(capella_name)
     except KeyError:
-        print("ATTENTION : type '%s' (-> '%s') introuvable (ni message/enum "
-              "de ce .proto, ni DataType primitif) : le champ/parametre "
-              "restera sans type." % (type_name, capella_name))
+        print("ATTENTION : type primitif '%s' (-> '%s') introuvable dans "
+              "le DataPkg racine, le champ/parametre restera sans type." %
+              (type_ref, capella_name))
         return None
 
 
@@ -218,165 +260,249 @@ def _get_or_create(collection, name, typehint=None, **create_kwargs):
         return collection.create(name=name, **create_kwargs), True
 
 
+def get_or_create_package_path(root_pkg, folder, cache):
+    """Cree/retrouve (find-or-create, idempotent) la hierarchie de
+    sous-packages Capella correspondant a un chemin de dossier proto
+    (ex: 'service_base_api', ou 'google/protobuf' -> 2 niveaux imbriques).
+    folder == "" (fichier a la racine, sans dossier) -> renvoie root_pkg
+    tel quel, sans sous-package. Fonctionne identiquement pour un
+    DataPkg ou un InterfacePkg (meme API .packages.by_name/.create).
+    cache : dict partage entre appels (cle = chemin cumule), pour eviter
+    de re-parcourir toute la hierarchie a chaque fichier."""
+    if not folder:
+        return root_pkg
+    if folder in cache:
+        return cache[folder]
+    current = root_pkg
+    accumulated = ""
+    for part in folder.split("/"):
+        accumulated = f"{accumulated}/{part}" if accumulated else part
+        if accumulated in cache:
+            current = cache[accumulated]
+            continue
+        try:
+            current = current.packages.by_name(part)
+        except KeyError:
+            current = current.packages.create(name=part)
+        cache[accumulated] = current
+    return current
+
+
 def import_proto_model(proto_model, data_pkg, interface_pkg, model):
-    created_classes = {}
-    created_enums = {}
+    """
+    data_pkg / interface_pkg : packages RACINE (ceux de la couche
+    choisie). Les messages/enums/interfaces de chaque fichier sont
+    places dans un sous-package miroir de son dossier (get_or_create_
+    package_path), sous cette racine -- un fichier a la racine (sans
+    dossier dans son chemin d'import) va directement dans data_pkg/
+    interface_pkg tels quels, sans sous-package supplementaire.
+    """
+    created_types = {}   # nom qualifie complet -> Class ou Enumeration Capella (TOUS fichiers)
     stats = {"created": 0, "updated": 0}
-    proto_message_names = {m["name"] for m in proto_model["messages"]}
+    data_pkg_cache, interface_pkg_cache = {}, {}
     package_stored = False
     package_pvmt_missing = False
+    source_file_stored = False
+    source_file_pvmt_missing = False
 
-    # Enums -> Enumeration (+ EnumerationLiteral), AVANT les Classes qui
-    # peuvent les referencer dans leurs champs.
-    # LIMITE : Capella ne stocke pas de valeur numerique explicite par
-    # litteral -- on suppose donc un enum proto3 standard, sequentiel a
-    # partir de 0 (le cas courant). Un enum avec des numeros customises/
-    # non contigus perdra cette numerotation au re-export (regenere
-    # sequentiellement). A affiner si vous en avez besoin.
-    for en in proto_model["enums"]:
-        capella_enum, is_new = _get_or_create(data_pkg.enumerations, en["name"])
-        stats["created" if is_new else "updated"] += 1
-        if en["comment"]:
-            capella_enum.description = en["comment"]
-        for value in en["values"]:
-            lit, _ = _get_or_create(capella_enum.owned_literals, value["name"])
-            if value["comment"]:
-                lit.description = value["comment"]
-        created_enums[en["name"]] = capella_enum
+    def set_source_file(element, path):
+        """Pose PVMT_SOURCE_FILE_KEY sur un element (Class/Enumeration/
+        Interface), optionnel -- met a jour les compteurs de synthese
+        plutot que d'imprimer un avertissement par element."""
+        nonlocal source_file_stored, source_file_pvmt_missing
+        try:
+            element.pvmt[PVMT_SOURCE_FILE_KEY] = path
+            source_file_stored = True
+        except KeyError:
+            source_file_pvmt_missing = True
 
-    # Messages -> Classes (find-or-create par nom)
-    for msg in proto_model["messages"]:
-        capella_class, is_new = _get_or_create(data_pkg.classes, msg["name"])
-        stats["created" if is_new else "updated"] += 1
-        if msg["comment"]:
-            capella_class.description = msg["comment"]
-        created_classes[msg["name"]] = capella_class
+    # --- Controle informatif : le chemin de DOSSIER (qui determine le
+    #     package Capella, cf. --proto-root) et la declaration "package"
+    #     interne au .proto peuvent diverger -- ce n'est jamais bloquant
+    #     (le dossier reste seul decisif pour la hierarchie Capella),
+    #     mais c'est souvent le signe d'une organisation non
+    #     conventionnelle ou d'un fichier importe "a plat" sans son
+    #     dossier d'origine (cf. discussion : counter.proto importe tel
+    #     quel vs range dans soba_template_api/).
+    for file_info in proto_model["files"]:
+        if file_info["package"] is None:
+            continue
+        expected_folder = file_info["package"].replace(".", "/")
+        if file_info["folder"] != expected_folder:
+            print(f"ATTENTION : '{file_info['path']}' declare "
+                  f"'package {file_info['package']};' (attendu comme dossier : "
+                  f"'{expected_folder}') mais son chemin de fichier reel est "
+                  f"'{file_info['folder'] or '(racine, aucun dossier)'}'  -- le package "
+                  f"Capella suivra le CHEMIN DE FICHIER, pas la declaration "
+                  f"'package'. Rangez le fichier dans '{expected_folder}/' si "
+                  f"vous voulez que les deux coincident.")
 
-    # deuxieme passe : les champs, une fois que toutes les Classes/Enums
-    # existent (pour resoudre les references de type message a message)
-    for msg in proto_model["messages"]:
-        capella_class = created_classes[msg["name"]]
-        proto_field_names = {f["name"] for f in msg["fields"]}
+    # --- Passe 1 : Enumerations, sur TOUS les fichiers (cible + imports
+    #     transitifs, y compris les well-known types Google) ---------
+    for file_info in proto_model["files"]:
+        target_data_pkg = get_or_create_package_path(data_pkg, file_info["folder"], data_pkg_cache)
+        for en in file_info["enums"]:
+            capella_enum, is_new = _get_or_create(target_data_pkg.enumerations, en["name"])
+            stats["created" if is_new else "updated"] += 1
+            if en["comment"]:
+                capella_enum.description = en["comment"]
+            set_source_file(capella_enum, file_info["path"])
+            for value in en["values"]:
+                lit, _ = _get_or_create(capella_enum.owned_literals, value["name"])
+                if value["comment"]:
+                    lit.description = value["comment"]
+            created_types[en["qualified_name"]] = capella_enum
 
-        for field in msg["fields"]:
-            prop, _ = _get_or_create(capella_class.owned_properties, field["name"])
-            if field["comment"]:
-                prop.description = field["comment"]
-            field_type = resolve_type(field["type"], data_pkg, created_classes, created_enums)
-            if field_type is not None:
-                prop.type = field_type
+    # --- Passe 2 : Classes (juste creees, sans les champs -- pour que
+    #     TOUTES les classes de TOUS les fichiers soient disponibles
+    #     avant de resoudre le moindre champ, y compris les references
+    #     circulaires entre fichiers) -----------------------------------
+    for file_info in proto_model["files"]:
+        target_data_pkg = get_or_create_package_path(data_pkg, file_info["folder"], data_pkg_cache)
+        for msg in file_info["messages"]:
+            capella_class, is_new = _get_or_create(target_data_pkg.classes, msg["name"])
+            stats["created" if is_new else "updated"] += 1
+            if msg["comment"]:
+                capella_class.description = msg["comment"]
+            set_source_file(capella_class, file_info["path"])
+            created_types[msg["qualified_name"]] = capella_class
 
-        # Champs presents dans Capella mais plus dans le .proto source :
-        # NON supprimes automatiquement (une suppression auto pourrait
-        # casser d'autres references dans le modele) -- juste signales,
-        # a vous de decider si vous les retirez a la main.
-        orphan_fields = [p.name for p in capella_class.owned_properties
-                          if p.name not in proto_field_names]
-        if orphan_fields:
-            print(f"INFO : Class '{msg['name']}' contient des champs absents "
-                  f"de ce .proto (non supprimes) : {', '.join(orphan_fields)}")
+    # --- Passe 3 : les champs de chaque Classe, maintenant que le
+    #     registre global created_types est complet -----------------
+    # known_message_names_by_pkg : uuid du package -> (objet package,
+    # set des noms de Classe QU'ON VIENT DE TRAITER pour ce package,
+    # union sur tous les fichiers qui y contribuent -- plusieurs
+    # fichiers peuvent partager le meme dossier/package).
+    known_message_names_by_pkg = {}
+    for file_info in proto_model["files"]:
+        target_data_pkg = get_or_create_package_path(data_pkg, file_info["folder"], data_pkg_cache)
 
-    # Classes presentes dans Capella (ce DataPkg) mais absentes du .proto
-    orphan_classes = [c.name for c in data_pkg.classes
-                       if c.name not in proto_message_names and c.name not in created_classes]
-    # (orphan_classes n'est qu'indicatif si le DataPkg contient d'autres
-    # classes non liees a cet import -- a affiner si vous importez
-    # plusieurs .proto dans le meme DataPkg)
+        for msg in file_info["messages"]:
+            capella_class = created_types[msg["qualified_name"]]
+            proto_field_names = {f["name"] for f in msg["fields"]}
 
-    # Services -> Interfaces, rpc -> Service (Operation), params
-    for svc in proto_model["services"]:
-        capella_interface, is_new = _get_or_create(interface_pkg.interfaces, svc["name"])
-        stats["created" if is_new else "updated"] += 1
-        if svc["comment"]:
-            capella_interface.description = svc["comment"]
+            for field in msg["fields"]:
+                prop, _ = _get_or_create(capella_class.owned_properties, field["name"])
+                if field["comment"]:
+                    prop.description = field["comment"]
+                field_type = resolve_type(field["type"], data_pkg, created_types)
+                if field_type is not None:
+                    prop.type = field_type
 
-        # Package proto -> PVMT (optionnel, n'empeche pas l'import si
-        # absent -- contrairement au streaming). Signale une seule fois
-        # au niveau du modele (voir plus bas) si le groupe n'existe pas.
-        if proto_model["package"]:
-            try:
-                capella_interface.pvmt[PVMT_PACKAGE_KEY] = proto_model["package"]
-                package_stored = True
-            except KeyError:
-                package_pvmt_missing = True
+            orphan_fields = [p.name for p in capella_class.owned_properties
+                              if p.name not in proto_field_names]
+            if orphan_fields:
+                print(f"INFO : Class '{msg['name']}' ({file_info['path']}) contient des "
+                      f"champs absents de ce .proto (non supprimes) : {', '.join(orphan_fields)}")
 
-        proto_method_names = {m["name"] for m in svc["methods"]}
+        if file_info["messages"]:
+            pkg_obj, names = known_message_names_by_pkg.get(target_data_pkg.uuid, (target_data_pkg, set()))
+            names.update(m["name"] for m in file_info["messages"])
+            known_message_names_by_pkg[target_data_pkg.uuid] = (pkg_obj, names)
 
-        for method in svc["methods"]:
-            operation, op_is_new = _get_or_create(
-                capella_interface.owned_features, method["name"], typehint="Service")
-            if method["comment"]:
-                operation.description = method["comment"]
+    for target_data_pkg, known_names in known_message_names_by_pkg.values():
+        orphan_classes = [c.name for c in target_data_pkg.classes if c.name not in known_names]
+        if orphan_classes:
+            print(f"INFO : le package '{target_data_pkg.name}' contient d'autres Classes "
+                  f"non references par cet import : {', '.join(orphan_classes)}")
 
-            # google.protobuf.Empty : PAS de Parameter cree du tout pour
-            # ce cote-la (entree et/ou sortie) -- l'absence de Parameter
-            # EST l'encodage de "Empty" ; l'export saura le regenerer.
-            # Si un Parameter "request"/"response" existe deja d'un import
-            # precedent (avant ce fix) alors que le .proto dit maintenant
-            # Empty, on le retire pour rester coherent avec la source.
-            if method["input_is_empty"]:
+    # --- Passe 4 : Interfaces/Services, sur TOUS les fichiers (pas
+    #     seulement le fichier cible -- un fichier importe qui declare
+    #     lui-meme un service voit aussi son Interface creee ; idempotent,
+    #     donc reimporter ce fichier plus tard directement ne duplique rien) --
+    for file_info in proto_model["files"]:
+        target_data_pkg = get_or_create_package_path(data_pkg, file_info["folder"], data_pkg_cache)
+        target_interface_pkg = get_or_create_package_path(interface_pkg, file_info["folder"], interface_pkg_cache)
+
+        for svc in file_info["services"]:
+            capella_interface, is_new = _get_or_create(target_interface_pkg.interfaces, svc["name"])
+            stats["created" if is_new else "updated"] += 1
+            if svc["comment"]:
+                capella_interface.description = svc["comment"]
+            set_source_file(capella_interface, file_info["path"])
+
+            if file_info["package"]:
                 try:
-                    operation.parameters.remove(operation.parameters.by_name("request"))
+                    capella_interface.pvmt[PVMT_PACKAGE_KEY] = file_info["package"]
+                    package_stored = True
                 except KeyError:
-                    pass
-            else:
-                in_type = resolve_type(method["input_type"], data_pkg, created_classes, created_enums)
+                    package_pvmt_missing = True
+
+            proto_method_names = {m["name"] for m in svc["methods"]}
+
+            for method in svc["methods"]:
+                operation, op_is_new = _get_or_create(
+                    capella_interface.owned_features, method["name"], typehint="Service")
+                if method["comment"]:
+                    operation.description = method["comment"]
+
+                # google.protobuf.Empty (et tout autre type, custom ou
+                # Google) est desormais un VRAI type resolu via le
+                # registre global -- plus de cas special "pas de
+                # Parameter" : Empty est juste un Class avec 0 champ,
+                # cree comme n'importe quel autre message importe.
+                in_type = resolve_type(method["input_type"], data_pkg, created_types)
                 in_param, _ = _get_or_create(operation.parameters, "request", direction="IN")
                 if in_type is not None:
                     in_param.type = in_type
 
-            if method["output_is_empty"]:
-                try:
-                    operation.parameters.remove(operation.parameters.by_name("response"))
-                except KeyError:
-                    pass
-            else:
-                out_type = resolve_type(method["output_type"], data_pkg, created_classes, created_enums)
+                out_type = resolve_type(method["output_type"], data_pkg, created_types)
                 out_param, _ = _get_or_create(operation.parameters, "response", direction="OUT")
                 if out_type is not None:
                     out_param.type = out_type
 
-            # Streaming -> PVMT, une seule propriete d'enumeration
-            # (necessite que le domaine/groupe/type existent deja)
-            mode_name = STREAMING_FLAGS_TO_MODE[(method["client_streaming"], method["server_streaming"])]
-            try:
-                literal = get_streaming_mode_literal(model, mode_name)
-                operation.pvmt[PVMT_STREAMING_MODE_KEY] = literal
-            except KeyError:
-                print("ATTENTION : domaine/groupe/enumeration PVMT '%s' introuvable "
-                      "(ou litteral '%s' absent), streaming non renseigne pour '%s'." %
-                      (PVMT_STREAMING_MODE_KEY, mode_name, method["name"]))
+                # Streaming -> PVMT, une seule propriete d'enumeration
+                mode_name = STREAMING_FLAGS_TO_MODE[(method["client_streaming"], method["server_streaming"])]
+                try:
+                    literal = get_streaming_mode_literal(model, mode_name)
+                    operation.pvmt[PVMT_STREAMING_MODE_KEY] = literal
+                except KeyError:
+                    print("ATTENTION : domaine/groupe/enumeration PVMT '%s' introuvable "
+                          "(ou litteral '%s' absent), streaming non renseigne pour '%s'." %
+                          (PVMT_STREAMING_MODE_KEY, mode_name, method["name"]))
 
-        # Operations presentes dans Capella mais plus dans le .proto :
-        # signalees, non supprimees (meme logique que pour les champs).
-        orphan_methods = [f.name for f in capella_interface.owned_features
-                           if type(f).__name__ == "Service" and f.name not in proto_method_names]
-        if orphan_methods:
-            print(f"INFO : Interface '{svc['name']}' contient des operations absentes "
-                  f"de ce .proto (non supprimees) : {', '.join(orphan_methods)}")
+            orphan_methods = [f.name for f in capella_interface.owned_features
+                               if type(f).__name__ == "Service" and f.name not in proto_method_names]
+            if orphan_methods:
+                print(f"INFO : Interface '{svc['name']}' contient des operations absentes "
+                      f"de ce .proto (non supprimees) : {', '.join(orphan_methods)}")
 
-    if orphan_classes:
-        print(f"INFO : le DataPkg contient d'autres Classes non references "
-              f"par ce .proto : {', '.join(orphan_classes)}")
-    if proto_model["package"]:
+    if source_file_stored:
+        print(f"INFO : chemin de fichier d'origine stocke via PVMT ({PVMT_SOURCE_FILE_KEY}) "
+              f"sur les Classes/Enumerations/Interfaces -- utilise par --output-root a "
+              f"l'export pour regenerer l'emplacement exact.")
+    if source_file_pvmt_missing:
+        domain_name, group_name = PVMT_SOURCE_FILE_KEY.split(".")[0:2]
+        print(f"INFO : chemin de fichier d'origine NON stocke -- le groupe PVMT "
+              f"'{domain_name}.{group_name}' n'a pas de propriete 'SourceFile' dans ce "
+              f"modele (optionnel, cf. proto_capella_types.py). --output-root utilisera "
+              f"alors le nom de l'element Capella comme nom de fichier, pas le nom exact "
+              f"d'origine.")
+
+    packages_used = sorted({fi["folder"] for fi in proto_model["files"] if fi["folder"]})
+    if packages_used:
+        print(f"INFO : packages Capella crees/reutilises (miroir des dossiers proto) : "
+              f"{', '.join(packages_used)}")
+    any_package_stmt = any(fi["package"] for fi in proto_model["files"])
+    if any_package_stmt:
         if package_stored:
-            print(f"INFO : package proto '{proto_model['package']}' stocke via PVMT "
-                  f"({PVMT_PACKAGE_KEY}) sur l'Interface.")
+            print(f"INFO : package(s) proto stocke(s) via PVMT ({PVMT_PACKAGE_KEY}) sur "
+                  f"les Interfaces concernees.")
         if package_pvmt_missing:
             domain_name, group_name = PVMT_PACKAGE_KEY.split(".")[0:2]
-            print(f"INFO : package proto '{proto_model['package']}' NON stocke -- le "
-                  f"groupe PVMT '{domain_name}.{group_name}' n'existe pas dans ce modele "
-                  f"(optionnel, cf. proto_capella_types.py). Repassez-le a l'export avec "
-                  f"--package si besoin.")
+            print(f"INFO : package(s) proto NON stocke(s) -- le groupe PVMT "
+                  f"'{domain_name}.{group_name}' n'existe pas dans ce modele (optionnel, "
+                  f"cf. proto_capella_types.py). Repassez-le a l'export avec --package si besoin.")
 
     print(f"Bilan : {stats['created']} element(s) cree(s), "
           f"{stats['updated']} element(s) deja existant(s) mis a jour.")
-    return created_classes
+    return created_types
 
 
 # --------------------------------------------------------------------
 # 4. Point d'entree
 # --------------------------------------------------------------------
+
 
 def check_pvmt_ready(model):
     """
@@ -424,19 +550,24 @@ def get_layer(model, layer_code):
 
 def referenced_primitive_capella_names(proto_model):
     """Noms Capella des types primitifs reellement references par les
-    champs de ce .proto (les types message/enum ne sont pas concernes,
-    ils deviennent des Classes creees par l'import lui-meme)."""
+    champs de TOUS les fichiers (cible + imports). Les types message/
+    enum ne sont pas concernes, ils deviennent des Classes/Enumerations
+    creees par l'import lui-meme, sur n'importe quel fichier."""
     names = set()
-    for msg in proto_model["messages"]:
-        for field in msg["fields"]:
-            if field["type"] in PROTO_TO_CAPELLA_PRIMITIVE:
-                names.add(PROTO_TO_CAPELLA_PRIMITIVE[field["type"]])
+    for file_info in proto_model["files"]:
+        for msg in file_info["messages"]:
+            for field in msg["fields"]:
+                if field["type"] in PROTO_TO_CAPELLA_PRIMITIVE:
+                    names.add(PROTO_TO_CAPELLA_PRIMITIVE[field["type"]])
     return names
 
 
 def check_types_ready(data_pkg, proto_model):
     """Mode --strict-types : n'auto-cree rien, arrete l'import si un
-    type primitif necessaire manque."""
+    type primitif necessaire manque. NB : les types primitifs restent
+    tous crees dans le DataPkg RACINE (pas dans les sous-packages par
+    dossier), quel que soit le fichier qui les utilise -- ce sont des
+    types partages, pas specifiques a un module proto."""
     needed = referenced_primitive_capella_names(proto_model)
     missing = []
     for name in sorted(needed):
@@ -447,7 +578,7 @@ def check_types_ready(data_pkg, proto_model):
     if missing:
         print(f"""
 ARRET (--strict-types) : les DataTypes primitifs suivants sont requis
-par ce .proto mais absents du DataPkg : {', '.join(missing)}
+par ce .proto (ou ses imports) mais absents du DataPkg : {', '.join(missing)}
 
 Lancez 'python setup_primitive_types.py {{Model.aird}} --layer=...'
 pour les creer, ou retirez --strict-types pour laisser l'import les
@@ -464,13 +595,21 @@ if __name__ == "__main__":
     parser.add_argument("--layer", default="la", choices=list(LAYER_CHOICES),
                          help="Couche d'architecture cible (defaut: la = Logical Architecture). "
                               "Choix : " + ", ".join(f"{k}={v}" for k, v in LAYER_CHOICES.items()))
+    parser.add_argument("--proto-root", default=None,
+                         help="Dossier racine par rapport auquel vos directives 'import' "
+                              "relatives se resolvent (ex: si vos protos font "
+                              "'import \"service_base_api/ServiceB.proto\";', --proto-root "
+                              "doit etre le dossier qui CONTIENT service_base_api/). Sans "
+                              "cet argument, seul le dossier direct du fichier cible est "
+                              "utilise -- suffisant pour un fichier isole, insuffisant pour "
+                              "des imports relatifs a une racine differente.")
     parser.add_argument("--strict-types", action="store_true",
                          help="N'auto-cree pas les DataTypes primitifs manquants ; "
                               "arrete l'import si l'un d'eux est absent (defaut : "
                               "auto-creation idempotente, avec message informatif).")
     args = parser.parse_args()
 
-    proto_model = parse_proto_file(args.proto_file)
+    proto_model = parse_proto_file(args.proto_file, proto_root=args.proto_root)
     model = capellambse.MelodyModel(args.model_path)
 
     if not check_pvmt_ready(model):
@@ -491,5 +630,7 @@ if __name__ == "__main__":
 
     created = import_proto_model(proto_model, data_pkg, interface_pkg, model)
     model.save()
-    print("Import termine dans %s : %d classes, %d services crees." %
-          (LAYER_CHOICES[args.layer], len(created), len(proto_model["services"])))
+    n_services = sum(len(fi["services"]) for fi in proto_model["files"])
+    print("Import termine dans %s : %d fichier(s) proto traite(s), %d classe(s)/enum(s) "
+          "au total, %d service(s) crees/mis a jour." %
+          (LAYER_CHOICES[args.layer], len(proto_model["files"]), len(created), n_services))

@@ -96,7 +96,15 @@ STREAMING_MODE_TO_FLAGS = {v: k for k, v in STREAMING_FLAGS_TO_MODE.items()}
 # l'import (le package reste alors seulement disponible via --package
 # a l'export). A creer manuellement dans Capella si vous le voulez :
 # meme domaine Grpc, nouveau groupe Metadata, propriete String "Package".
-# NON TESTE de bout en bout (aucune propriete String disponible dans le
-# modele de demo utilise pour les tests de ce projet) -- a valider une
-# premiere fois chez vous une fois la propriete creee.
+# CONFIRME fonctionnel en usage reel (voir conversation).
 PVMT_PACKAGE_KEY = "Grpc.Metadata.Package"
+
+# PVMT optionnel (String) pour stocker le CHEMIN RELATIF exact du
+# fichier .proto d'origine (ex: "service_base_api/ServiceB.proto"),
+# sur Class/Enumeration/Interface -- meme groupe Metadata que Package,
+# nouvelle propriete String "SourceFile". Permet a l'export de
+# regenerer le fichier de sortie au bon endroit avec le bon nom (cf.
+# --output-root), sans avoir a deviner un nom de fichier a partir du
+# seul nom de l'element Capella. Optionnel, meme comportement degrade
+# que Package si absent (export retombe sur <InterfaceName>.proto).
+PVMT_SOURCE_FILE_KEY = "Grpc.Metadata.SourceFile"

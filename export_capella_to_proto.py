@@ -32,6 +32,7 @@ LIMITES CONNUES (fidelite du round-trip) :
 """
 
 import sys
+import os
 import argparse
 import html
 import capellambse
@@ -41,18 +42,63 @@ from proto_capella_types import (
     PVMT_STREAMING_MODE_KEY,
     STREAMING_MODE_TO_FLAGS,
     PVMT_PACKAGE_KEY,
+    PVMT_SOURCE_FILE_KEY,
 )
 
 LAYER_CHOICES = {"oa": "Operational Analysis", "sa": "System Analysis",
                   "la": "Logical Architecture", "pa": "Physical Architecture"}
 
-EMPTY_TYPE_PROTO_NAME = "google.protobuf.Empty"
-EMPTY_TYPE_IMPORT = 'import "google/protobuf/empty.proto";'
+# Types Google "well-known" geres avec un vrai "import", pas redefinis
+# inline -- nom Capella (= nom proto court) -> nom de fichier .proto
+# standard sous google/protobuf/. Uniquement reconnus s'ils vivent
+# EFFECTIVEMENT dans un package Capella 'google/protobuf' (cf.
+# get_capella_type_folder) -- un Empty personnel ailleurs ne serait pas
+# traite comme le well-known type.
+WELL_KNOWN_GOOGLE_FOLDER = "google/protobuf"
+WELL_KNOWN_GOOGLE_FILES = {
+    "Empty": "empty", "Timestamp": "timestamp", "Duration": "duration",
+    "Struct": "struct", "Value": "struct", "ListValue": "struct",
+    "Any": "any", "FieldMask": "field_mask",
+    "BoolValue": "wrappers", "Int32Value": "wrappers", "Int64Value": "wrappers",
+    "UInt32Value": "wrappers", "UInt64Value": "wrappers", "FloatValue": "wrappers",
+    "DoubleValue": "wrappers", "StringValue": "wrappers", "BytesValue": "wrappers",
+}
 
 
-def proto_type_name(capella_type):
+def get_capella_type_folder(container_pkg):
+    """Reconstruit le chemin de dossier proto ('google/protobuf',
+    'service_base_api'...) a partir du package Capella conteneur d'un
+    type, en remontant les DataPkg/InterfacePkg imbriques -- symetrique
+    de get_or_create_package_path() cote import. Le DataPkg/InterfacePkg
+    RACINE (celui de la couche) est exclu du chemin, detecte par le
+    fait que SON parent n'est plus un DataPkg/InterfacePkg (c'est la
+    Layer elle-meme)."""
+    names = []
+    pkg = container_pkg
+    while type(pkg).__name__ in ("DataPkg", "InterfacePkg") and \
+          type(pkg.parent).__name__ in ("DataPkg", "InterfacePkg"):
+        names.insert(0, pkg.name)
+        pkg = pkg.parent
+    return "/".join(names)
+
+
+def is_well_known_google_type(capella_type):
+    return (capella_type is not None
+            and capella_type.name in WELL_KNOWN_GOOGLE_FILES
+            and get_capella_type_folder(capella_type.parent) == WELL_KNOWN_GOOGLE_FOLDER)
+
+
+def proto_type_name(capella_type, needed_imports=None):
+    """needed_imports : set mutable, alimente avec le chemin
+    'google/protobuf/xxx.proto' si capella_type est un well-known type
+    Google -- l'appelant s'en sert pour ecrire les 'import' necessaires."""
     if capella_type is None:
-        return None  # type reellement inconnu -- distinct de "pas de type" (Empty)
+        return None  # type reellement inconnu
+    if is_well_known_google_type(capella_type):
+        if needed_imports is not None:
+            file_stem = WELL_KNOWN_GOOGLE_FILES[capella_type.name]
+            needed_imports.add(f"google/protobuf/{file_stem}.proto")
+        return f"google.protobuf.{capella_type.name}"
     return CAPELLA_TO_PROTO_PRIMITIVE.get(capella_type.name, capella_type.name)
 
 
@@ -74,13 +120,13 @@ def _as_comment_lines(description, indent=""):
     return lines
 
 
-def class_to_proto_message(cls):
+def class_to_proto_message(cls, needed_imports):
     lines = _as_comment_lines(cls.description)
     lines.append(f"message {cls.name} {{")
     for counter, prop in enumerate(cls.owned_properties, start=1):
         lines.extend(_as_comment_lines(prop.description, indent="    "))
         multiplicity = "repeated " if is_repeated(prop) else ""
-        type_name = proto_type_name(prop.type)
+        type_name = proto_type_name(prop.type, needed_imports)
         if type_name is None:
             lines.append(f"    // ATTENTION : type non resolu pour ce champ -- verifiez le modele")
             type_name = "bytes"  # place-holder syntaxiquement valide, signale ci-dessus
@@ -101,9 +147,10 @@ def enum_to_proto(enum):
     return "\n".join(lines)
 
 
-def interface_to_proto_service(interface, uses_empty):
-    """uses_empty : set mutable, alimente ici si Empty est rencontre
-    (pour que l'appelant sache s'il doit ecrire l'import correspondant)."""
+def interface_to_proto_service(interface, needed_imports):
+    """needed_imports : set mutable, alimente si un well-known type
+    Google est rencontre (pour que l'appelant sache quels 'import'
+    ecrire)."""
     lines = _as_comment_lines(interface.description)
     lines.append(f"service {interface.name} {{")
     for op in interface.owned_features:
@@ -113,27 +160,15 @@ def interface_to_proto_service(interface, uses_empty):
         in_param = next((p for p in op.parameters if str(p.direction) == "IN"), None)
         out_param = next((p for p in op.parameters if str(p.direction) == "OUT"), None)
 
-        # Absence de Parameter == google.protobuf.Empty (c'est ainsi que
-        # l'import encode ce cas special -- cf. import_proto_to_capella.py)
-        if in_param is None:
-            in_type = EMPTY_TYPE_PROTO_NAME
-            uses_empty.add(True)
-        else:
-            in_type = proto_type_name(in_param.type)
-            if in_type is None:
-                lines.append(f"    // ATTENTION : type d'entree non resolu pour '{op.name}'")
-                in_type = EMPTY_TYPE_PROTO_NAME
-                uses_empty.add(True)
+        in_type = proto_type_name(in_param.type, needed_imports) if in_param else None
+        if in_type is None:
+            lines.append(f"    // ATTENTION : type d'entree non resolu pour '{op.name}'")
+            in_type = "bytes"
 
-        if out_param is None:
-            out_type = EMPTY_TYPE_PROTO_NAME
-            uses_empty.add(True)
-        else:
-            out_type = proto_type_name(out_param.type)
-            if out_type is None:
-                lines.append(f"    // ATTENTION : type de sortie non resolu pour '{op.name}'")
-                out_type = EMPTY_TYPE_PROTO_NAME
-                uses_empty.add(True)
+        out_type = proto_type_name(out_param.type, needed_imports) if out_param else None
+        if out_type is None:
+            lines.append(f"    // ATTENTION : type de sortie non resolu pour '{op.name}'")
+            out_type = "bytes"
 
         try:
             mode_literal = op.pvmt[PVMT_STREAMING_MODE_KEY]
@@ -158,13 +193,24 @@ def _collect_referenced_types(interface):
     profondeur) pour recuperer toutes les Class et Enumeration a
     exporter -- pas seulement celles directement en parametre de rpc.
 
+    Les well-known types Google (Empty, Timestamp...) sont EXCLUS du
+    resultat : ils sont geres a part, via un vrai "import", jamais
+    redefinis inline (cf. proto_type_name).
+
+    LIMITE CONNUE : les types CUSTOM d'un autre package Capella que
+    celui de l'Interface exportee (ex: reference croisee entre deux
+    dossiers proto distincts, hors google/protobuf) sont, pour
+    l'instant, toujours redefinis EN LIGNE dans le fichier de sortie
+    (comme avant), plutot que via un "import" precis vers leur fichier
+    d'origine -- cette information (quel FICHIER exact, pas juste quel
+    dossier/package) n'est pas conservee par l'import actuel. Le
+    fichier genere reste valide et autonome (il se suffit a lui-meme),
+    simplement pas organise en plusieurs fichiers comme l'original.
+
     Le RESULTAT est ensuite reordonne selon l'ordre naturel du DataPkg
-    (data_pkg.classes / data_pkg.enumerations), qui correspond a l'ordre
-    de declaration d'origine dans le .proto importe (cf. import :
-    les Class/Enumeration sont creees dans l'ordre du fichier source).
-    Le parcours lui-meme (recherche en profondeur, ordre de pile) sert
-    uniquement a trouver l'ensemble complet des types ; ce n'est pas
-    l'ordre de sortie final."""
+    (data_pkg.classes / data_pkg.enumerations) DE CHAQUE PACKAGE
+    D'ORIGINE, qui correspond a l'ordre de declaration d'origine dans
+    le .proto importe."""
     classes, enums = {}, {}
     to_visit = []
 
@@ -177,6 +223,8 @@ def _collect_referenced_types(interface):
 
     while to_visit:
         t = to_visit.pop()
+        if is_well_known_google_type(t):
+            continue  # gere a part (import), jamais inline
         kind = type(t).__name__
         if kind == "Class" and t.name not in classes:
             classes[t.name] = t
@@ -186,16 +234,23 @@ def _collect_referenced_types(interface):
         elif kind == "Enumeration" and t.name not in enums:
             enums[t.name] = t
 
-    # Reordonner selon l'ordre naturel du DataPkg (= ordre de declaration
-    # d'origine). data_pkg est accessible via le parent de n'importe quel
-    # type deja collecte (toutes les Class/Enumeration d'une meme
-    # Interface vivent dans le meme DataPkg dans notre modele d'import).
-    if classes or enums:
-        data_pkg = next(iter(classes.values())).parent if classes else next(iter(enums.values())).parent
-        class_order = {c.name: i for i, c in enumerate(data_pkg.classes)}
-        enum_order = {e.name: i for i, e in enumerate(data_pkg.enumerations)}
-        classes = dict(sorted(classes.items(), key=lambda kv: class_order.get(kv[0], 0)))
-        enums = dict(sorted(enums.items(), key=lambda kv: enum_order.get(kv[0], 0)))
+    # Reordonner selon l'ordre naturel du DataPkg d'origine de CHAQUE
+    # type (plusieurs packages possibles desormais, contrairement a la
+    # version a plat -- on trie par (chemin du package, position dans
+    # ce package) pour un resultat stable et groupe par module).
+    def sort_key(item, is_enum):
+        name, obj = item
+        pkg = obj.parent
+        folder = get_capella_type_folder(pkg)
+        collection = pkg.enumerations if is_enum else pkg.classes
+        try:
+            position = list(collection).index(obj)
+        except ValueError:
+            position = 0
+        return (folder, position)
+
+    classes = dict(sorted(classes.items(), key=lambda kv: sort_key(kv, False)))
+    enums = dict(sorted(enums.items(), key=lambda kv: sort_key(kv, True)))
 
     return classes, enums
 
@@ -231,20 +286,20 @@ def export_interface_to_proto(interface, referenced_classes=None, referenced_enu
         referenced_classes = referenced_classes if referenced_classes is not None else auto_classes
         referenced_enums = referenced_enums if referenced_enums is not None else auto_enums
 
-    uses_empty = set()
+    needed_imports = set()  # chemins 'google/protobuf/xxx.proto'
     enum_blocks = []
     for en in referenced_enums.values():
         enum_blocks.append(enum_to_proto(en))
         enum_blocks.append("")
     message_blocks = []
     for cls in referenced_classes.values():
-        message_blocks.append(class_to_proto_message(cls))
+        message_blocks.append(class_to_proto_message(cls, needed_imports))
         message_blocks.append("")
-    service_block = interface_to_proto_service(interface, uses_empty)
+    service_block = interface_to_proto_service(interface, needed_imports)
 
     header = ['syntax = "proto3";']
-    if uses_empty:
-        header.append(EMPTY_TYPE_IMPORT)
+    for import_path in sorted(needed_imports):
+        header.append(f'import "{import_path}";')
     if package:
         header.append(f"package {package};")
     header.append("")  # une seule ligne vide separant le header du corps
@@ -275,11 +330,37 @@ def find_interface(model, interface_name, layer_code=None):
     return candidates[0]
 
 
+def compute_output_path(interface, output_root):
+    """Reconstruit le chemin de sortie sous output_root :
+    - si PVMT_SOURCE_FILE_KEY est renseigne (cf. import), utilise le
+      chemin EXACT d'origine (ex: 'service_base_api/ServiceB.proto') --
+      fidele au nom de fichier reel, pas juste au nom de l'Interface.
+    - sinon, repli sur <dossier miroir du package Capella>/
+      <InterfaceName>.proto (approximatif : le nom de fichier n'est pas
+      garanti correspondre a l'original, cf. limite documentee)."""
+    try:
+        source_file = interface.pvmt[PVMT_SOURCE_FILE_KEY]
+        if source_file:
+            return os.path.join(output_root, source_file)
+    except KeyError:
+        pass
+    folder = get_capella_type_folder(interface.parent)
+    filename = f"{interface.name}.proto"
+    return os.path.join(output_root, folder, filename) if folder else os.path.join(output_root, filename)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export Capella Interface -> .proto")
     parser.add_argument("model_path", help="Chemin vers le fichier .aird du modele Capella")
     parser.add_argument("interface_name", help="Nom de l'Interface Capella a exporter")
-    parser.add_argument("output_path", help="Fichier .proto de sortie")
+    parser.add_argument("output_path", nargs="?", default=None,
+                         help="Fichier .proto de sortie (chemin exact). Incompatible avec "
+                              "--output-root -- utilisez l'un ou l'autre.")
+    parser.add_argument("--output-root", default=None,
+                         help="Dossier racine : le fichier est ecrit automatiquement dans "
+                              "<output-root>/<dossier miroir du package Capella>/"
+                              "<InterfaceName>.proto (les dossiers manquants sont crees). "
+                              "Incompatible avec output_path.")
     parser.add_argument("--layer", default=None, choices=list(LAYER_CHOICES),
                          help="Restreint la recherche a une couche si le nom est ambigu. "
                               "Choix : " + ", ".join(f"{k}={v}" for k, v in LAYER_CHOICES.items()))
@@ -294,11 +375,19 @@ if __name__ == "__main__":
                               "lire Grpc.Metadata.Package via PVMT ; sinon omis.")
     args = parser.parse_args()
 
+    if bool(args.output_path) == bool(args.output_root):
+        print("ERREUR : donnez soit un chemin de sortie explicite, soit --output-root "
+              "(pas les deux, pas aucun des deux).")
+        sys.exit(1)
+
     model = capellambse.MelodyModel(args.model_path)
     interface = find_interface(model, args.interface_name, args.layer)
 
+    output_path = args.output_path or compute_output_path(interface, args.output_root)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
     text = export_interface_to_proto(interface, order=args.order, package=args.package)
-    with open(args.output_path, "w") as f:
+    with open(output_path, "w") as f:
         f.write(text)
 
-    print(f"Export termine ({interface.layer.name}) : {args.output_path}")
+    print(f"Export termine ({interface.layer.name}) : {output_path}")
