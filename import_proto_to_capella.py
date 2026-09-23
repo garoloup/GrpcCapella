@@ -10,6 +10,9 @@ meme package Capella).
 
 Usage :
     python3 import_proto_to_capella.py mon_service.proto /chemin/vers/Model.aird [--layer=la] [--proto-root=DOSSIER] [--strict-types]
+    python3 import_proto_to_capella.py mon_dossier_protos/ /chemin/vers/Model.aird [--layer=la] [--strict-types]
+        (mode arborescence : tous les .proto sous ce dossier, recursivement --
+        --proto-root vaut ce dossier par defaut si non precise)
 
 --layer : oa (Operational Analysis) / sa (System Analysis) /
           la (Logical Architecture, defaut) / pa (Physical Architecture)
@@ -47,6 +50,7 @@ from proto_capella_types import (
     STREAMING_FLAGS_TO_MODE,
     PVMT_PACKAGE_KEY,
     PVMT_SOURCE_FILE_KEY,
+    PVMT_HEADER_KEY,
 )
 from setup_primitive_types import ensure_primitive_types
 
@@ -87,6 +91,20 @@ def _build_comment_index(file_proto):
         if comment:
             index[tuple(loc.path)] = comment
     return index
+
+
+def _extract_header_comment(file_proto):
+    """
+    Le cartouche d'en-tete (licence/copyright) est un bloc de
+    commentaires SEPARE de 'syntax = ...;' par une ligne vide -- ce
+    qui en fait un commentaire "detache" (leading_detached_comments),
+    pas un leading_comments normal. Rattache au champ "syntax" de
+    FileDescriptorProto, path [12] (verifie par test direct sur un
+    fichier .proto reel avec licence Apache en tete)."""
+    for loc in file_proto.source_code_info.location:
+        if list(loc.path) == [12] and loc.leading_detached_comments:
+            return "\n\n".join(c.strip() for c in loc.leading_detached_comments).strip()
+    return ""
 
 
 import grpc_tools
@@ -192,6 +210,7 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
             "path": file_proto.name,
             "folder": folder,
             "package": file_proto.package or None,
+            "header": _extract_header_comment(file_proto),
             "messages": messages,
             "enums": enums,
             "services": services,
@@ -304,6 +323,8 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
     package_pvmt_missing = False
     source_file_stored = False
     source_file_pvmt_missing = False
+    header_stored = False
+    header_pvmt_missing = False
 
     def set_source_file(element, path):
         """Pose PVMT_SOURCE_FILE_KEY sur un element (Class/Enumeration/
@@ -315,6 +336,18 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             source_file_stored = True
         except KeyError:
             source_file_pvmt_missing = True
+
+    def set_header(element, header):
+        """Pose PVMT_HEADER_KEY (cartouche licence/copyright), optionnel,
+        seulement si le fichier en a effectivement un."""
+        nonlocal header_stored, header_pvmt_missing
+        if not header:
+            return
+        try:
+            element.pvmt[PVMT_HEADER_KEY] = header
+            header_stored = True
+        except KeyError:
+            header_pvmt_missing = True
 
     # --- Controle informatif : le chemin de DOSSIER (qui determine le
     #     package Capella, cf. --proto-root) et la declaration "package"
@@ -347,6 +380,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             if en["comment"]:
                 capella_enum.description = en["comment"]
             set_source_file(capella_enum, file_info["path"])
+            set_header(capella_enum, file_info["header"])
             for value in en["values"]:
                 lit, _ = _get_or_create(capella_enum.owned_literals, value["name"])
                 if value["comment"]:
@@ -365,6 +399,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             if msg["comment"]:
                 capella_class.description = msg["comment"]
             set_source_file(capella_class, file_info["path"])
+            set_header(capella_class, file_info["header"])
             created_types[msg["qualified_name"]] = capella_class
 
     # --- Passe 3 : les champs de chaque Classe, maintenant que le
@@ -420,6 +455,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             if svc["comment"]:
                 capella_interface.description = svc["comment"]
             set_source_file(capella_interface, file_info["path"])
+            set_header(capella_interface, file_info["header"])
 
             if file_info["package"]:
                 try:
@@ -467,6 +503,13 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 print(f"INFO : Interface '{svc['name']}' contient des operations absentes "
                       f"de ce .proto (non supprimees) : {', '.join(orphan_methods)}")
 
+    if header_stored:
+        print(f"INFO : cartouche(s) d'en-tete stocke(s) via PVMT ({PVMT_HEADER_KEY}).")
+    if header_pvmt_missing:
+        domain_name, group_name = PVMT_HEADER_KEY.split(".")[0:2]
+        print(f"INFO : cartouche(s) d'en-tete NON stocke(s) -- le groupe PVMT "
+              f"'{domain_name}.{group_name}' n'a pas de propriete 'FileHeader' dans ce "
+              f"modele (optionnel, cf. proto_capella_types.py).")
     if source_file_stored:
         print(f"INFO : chemin de fichier d'origine stocke via PVMT ({PVMT_SOURCE_FILE_KEY}) "
               f"sur les Classes/Enumerations/Interfaces -- utilise par --output-root a "
@@ -590,7 +633,9 @@ creer automatiquement.
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Import .proto -> Capella")
-    parser.add_argument("proto_file", help="Fichier .proto a importer")
+    parser.add_argument("proto_path", help="Fichier .proto, OU dossier a parcourir "
+                         "recursivement pour importer tous les .proto qu'il contient "
+                         "(mode arborescence, detecte automatiquement).")
     parser.add_argument("model_path", help="Chemin vers le fichier .aird du modele Capella")
     parser.add_argument("--layer", default="la", choices=list(LAYER_CHOICES),
                          help="Couche d'architecture cible (defaut: la = Logical Architecture). "
@@ -599,17 +644,35 @@ if __name__ == "__main__":
                          help="Dossier racine par rapport auquel vos directives 'import' "
                               "relatives se resolvent (ex: si vos protos font "
                               "'import \"service_base_api/ServiceB.proto\";', --proto-root "
-                              "doit etre le dossier qui CONTIENT service_base_api/). Sans "
-                              "cet argument, seul le dossier direct du fichier cible est "
-                              "utilise -- suffisant pour un fichier isole, insuffisant pour "
-                              "des imports relatifs a une racine differente.")
+                              "doit etre le dossier qui CONTIENT service_base_api/). En mode "
+                              "arborescence (proto_path est un dossier), --proto-root vaut "
+                              "par defaut ce dossier lui-meme si non precise -- c'est "
+                              "generalement ce que vous voulez.")
     parser.add_argument("--strict-types", action="store_true",
                          help="N'auto-cree pas les DataTypes primitifs manquants ; "
                               "arrete l'import si l'un d'eux est absent (defaut : "
                               "auto-creation idempotente, avec message informatif).")
     args = parser.parse_args()
 
-    proto_model = parse_proto_file(args.proto_file, proto_root=args.proto_root)
+    if os.path.isdir(args.proto_path):
+        proto_files = []
+        for root, _dirs, filenames in os.walk(args.proto_path):
+            for fn in sorted(filenames):
+                if fn.endswith(".proto"):
+                    proto_files.append(os.path.join(root, fn))
+        proto_files.sort()
+        if not proto_files:
+            print(f"ERREUR : aucun fichier .proto trouve sous '{args.proto_path}'.")
+            sys.exit(1)
+        proto_root = args.proto_root or args.proto_path
+        print(f"INFO : mode arborescence -- {len(proto_files)} fichier(s) .proto trouve(s) "
+              f"sous '{args.proto_path}' (proto-root='{proto_root}') :")
+        for pf in proto_files:
+            print(f"    {pf}")
+    else:
+        proto_files = [args.proto_path]
+        proto_root = args.proto_root
+
     model = capellambse.MelodyModel(args.model_path)
 
     if not check_pvmt_ready(model):
@@ -619,18 +682,30 @@ if __name__ == "__main__":
     data_pkg = layer.data_pkg
     interface_pkg = layer.interface_pkg
 
-    if args.strict_types:
-        if not check_types_ready(data_pkg, proto_model):
-            sys.exit(1)
-    else:
-        types_created, types_existing = ensure_primitive_types(data_pkg)
-        if types_created:
-            print(f"INFO : DataTypes primitifs crees automatiquement : "
-                  f"{', '.join(types_created)}")
+    all_created = {}
+    total_services = 0
+    total_files_processed = 0
 
-    created = import_proto_model(proto_model, data_pkg, interface_pkg, model)
+    for proto_path in proto_files:
+        print(f"\n=== {proto_path} ===")
+        proto_model = parse_proto_file(proto_path, proto_root=proto_root)
+
+        if args.strict_types:
+            if not check_types_ready(data_pkg, proto_model):
+                sys.exit(1)
+        else:
+            types_created, types_existing = ensure_primitive_types(data_pkg)
+            if types_created:
+                print(f"INFO : DataTypes primitifs crees automatiquement : "
+                      f"{', '.join(types_created)}")
+
+        created = import_proto_model(proto_model, data_pkg, interface_pkg, model)
+        all_created.update(created)
+        total_services += sum(len(fi["services"]) for fi in proto_model["files"])
+        total_files_processed += len(proto_model["files"])
+
     model.save()
-    n_services = sum(len(fi["services"]) for fi in proto_model["files"])
-    print("Import termine dans %s : %d fichier(s) proto traite(s), %d classe(s)/enum(s) "
-          "au total, %d service(s) crees/mis a jour." %
-          (LAYER_CHOICES[args.layer], len(proto_model["files"]), len(created), n_services))
+    print("\nImport termine dans %s : %d fichier(s) .proto traite(s) (cibles + imports "
+          "transitifs confondus), %d classe(s)/enum(s) au total, %d service(s) crees/mis "
+          "a jour." % (LAYER_CHOICES[args.layer], total_files_processed,
+                        len(all_created), total_services))

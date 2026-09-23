@@ -61,6 +61,21 @@ python import_proto_to_capella.py mon_service.proto Mon_Modele.aird \
     [--layer=la] [--proto-root=DOSSIER] [--strict-types]
 ```
 
+Ou, pour traiter **toute une arborescence** de fichiers `.proto` d'un
+coup (mode détecté automatiquement dès que le premier argument est un
+dossier, pas un fichier) :
+
+```bash
+python import_proto_to_capella.py mon_dossier_protos/ Mon_Modele.aird [--strict-types]
+```
+
+Parcourt récursivement le dossier, importe chaque `.proto` trouvé (dans
+un ordre stable), un seul `model.save()` à la fin. `--proto-root` vaut
+alors ce dossier par défaut si non précisé — généralement ce que vous
+voulez. Comme l'import est idempotent (§8), peu importe l'ordre dans
+lequel les fichiers sont traités : deux fichiers qui se référencent
+mutuellement convergent vers le même résultat.
+
 - `--layer` : couche cible, `oa` / `sa` / `la` (défaut) / `pa` —
   respectivement Operational Analysis, System Analysis, Logical
   Architecture, Physical Architecture. Pour des interfaces logicielles
@@ -90,8 +105,10 @@ fichier cible et tous ses imports transitifs, y compris les
 - Les commentaires `.proto` (au-dessus de chaque
   message/champ/enum/service/rpc) → la `description` Capella
   correspondante.
+- Le cartouche d'en-tête (licence/copyright, séparé du reste par une
+  ligne vide) → PVMT, optionnel (voir §7.4).
 - Le mode de streaming (`stream` sur la requête et/ou la réponse) →
-  PVMT (voir §7).
+  PVMT (voir §7.1).
 - L'organisation en dossiers de vos fichiers `.proto` → une hiérarchie
   de sous-packages Capella miroir (voir §5).
 
@@ -101,7 +118,7 @@ ne duplique jamais les éléments déjà présents — voir §8.
 
 **Pré-requis dans le modèle**, dans la couche visée : un `DataPkg` et
 un `InterfacePkg` existants (créés par défaut par Capella), ainsi que
-le PVMT du streaming (§7, toujours manuel — pas d'auto-création
+le PVMT du streaming (§7.1, toujours manuel — pas d'auto-création
 possible pour PVMT, contrairement aux types primitifs, §6).
 
 Pour vérifier ce qui a été créé sans repasser par l'interface Capella :
@@ -125,14 +142,25 @@ python export_capella_to_proto.py Mon_Modele.aird NomDuService \
     --output-root=protos [--layer=la] [--order=messages-first] [--package=mon.pkg]
 ```
 
-`sortie.proto` (chemin exact) et `--output-root` (dossier racine,
-arborescence régénérée automatiquement dessous) sont **mutuellement
-exclusifs** — donnez l'un ou l'autre, jamais les deux, jamais aucun
-des deux.
+ou, pour **tout exporter d'un coup** (symétrique du mode arborescence
+de l'import, §3) :
+
+```bash
+python export_capella_to_proto.py Mon_Modele.aird --all --output-root=protos [--layer=la]
+```
+
+Exporte toutes les Interfaces trouvées (limitées à `--layer` si
+précisé), en régénérant l'arborescence complète sous `--output-root`.
+`--all` est incompatible avec un nom d'Interface ou un chemin de
+sortie explicite — `--output-root` est alors obligatoire.
+
+`sortie.proto` (chemin exact), `--output-root` seul, et `--all` (qui
+impose `--output-root`) sont **mutuellement exclusifs** — un seul de
+ces trois modes à la fois.
 
 - `--layer` : optionnel, sert à lever l'ambiguïté si une Interface du
-  même nom existe dans plusieurs couches (le script s'arrête avec une
-  erreur explicite dans ce cas si `--layer` n'est pas précisé).
+  même nom existe dans plusieurs couches (mode simple), ou à
+  restreindre `--all` à une seule couche.
 - `--order` : `messages-first` (défaut, convention gRPC officielle —
   les types détaillés d'abord, le service en dernier) ou
   `service-first` (le service en tête du fichier, convention utilisée
@@ -140,16 +168,22 @@ des deux.
   valide et recompilable.
 - `--package` : force le `package` proto écrit en tête de fichier.
   Sans cet argument, l'export tente de le lire automatiquement depuis
-  le PVMT de l'Interface (§7) ; si absent des deux côtés, aucune ligne
+  le PVMT de l'Interface (§7.2) ; si absent des deux côtés, aucune ligne
   `package` n'est écrite. Un `--package` explicite est toujours
-  prioritaire sur le PVMT.
+  prioritaire sur le PVMT. En mode `--all`, généralement à laisser vide
+  pour que chaque fichier garde son propre package via PVMT.
 
-Régénère : `syntax = "proto3";`, les `import` nécessaires (well-known
-types Google détectés automatiquement, voir §5), le `package`
-optionnel, les `enum`/`message` référencés (transitivement, y compris
-à travers les champs des messages eux-mêmes), puis le `service` avec
-ses `rpc` (streaming recalculé depuis PVMT), et les commentaires
-depuis les `description` Capella.
+Régénère : le cartouche d'en-tête s'il a été mémorisé (§7.4),
+`syntax = "proto3";`, les `import` nécessaires (well-known types
+Google détectés automatiquement + références croisées vers un autre
+fichier du même package si `SourceFile` est configuré, voir §5), le
+`package` optionnel, les `enum`/`message` référencés (transitivement,
+y compris à travers les champs des messages eux-mêmes), puis le
+`service` avec ses `rpc` (streaming recalculé depuis PVMT), et les
+commentaires depuis les `description` Capella — un commentaire tenant
+sur une seule ligne est réaligné en fin de ligne de code (comme dans
+un `.proto` écrit à la main), un commentaire multi-lignes reste en
+bloc au-dessus.
 
 
 ## 5. Organisation en packages Capella (miroir des dossiers proto)
@@ -214,21 +248,28 @@ python export_capella_to_proto.py Model.aird ServiceA --output-root=protos --lay
 ```
 
 Le nom de fichier utilise, par priorité : le chemin exact d'origine
-s'il a été mémorisé via PVMT (`SourceFile`, §7), sinon
+s'il a été mémorisé via PVMT (`SourceFile`, §7.3), sinon
 `<NomInterface>.proto` dans le dossier miroir du package Capella
 (approximatif si le nom du fichier `.proto` d'origine différait du nom
 du service qu'il contient).
 
-**Limite connue** : une référence croisée vers un type **custom** (pas
-Google) d'un *autre* package Capella que celui de l'Interface exportée
-est, pour l'instant, toujours **redéfinie en ligne** dans le fichier
-de sortie plutôt que référencée via un `import` précis vers son
-fichier d'origine exact — même si ce fichier d'origine est
-potentiellement connu via `SourceFile` (PVMT), ce mécanisme n'est pas
-encore exploité pour régénérer un vrai `import` inter-fichiers
-personnalisé. Le fichier généré reste valide et autonome (il se suffit
-à lui-même), simplement pas éclaté en plusieurs fichiers comme
-l'original pourrait l'être.
+**Références croisées entre fichiers d'un même package** : si
+`SourceFile` (§7.3) est configuré, une référence vers un type **custom**
+défini dans un *autre fichier* `.proto` (même s'il partage le même
+package Capella) est désormais correctement gérée via un vrai
+`import "chemin/exact/vers/CeFichier.proto";`, pas redéfinie en double
+— important en mode `--all` (§4), où plusieurs fichiers exportés
+ensemble doivent rester compilables comme un tout cohérent (deux
+fichiers qui redéfiniraient chacun le même message ne compileraient
+plus une fois assemblés). **Sans `SourceFile`** (PVMT non configuré),
+repli sur l'ancien comportement : le type est toujours redéfini en
+ligne — le fichier généré reste valide et autonome pris isolément,
+mais pas forcément si vous rassemblez plusieurs exports `--all` d'un
+même package sans `SourceFile` configuré.
+
+Cette résolution ne s'étend pas (encore) aux références croisées entre
+**packages Capella différents** (dossiers proto distincts, hors
+google/protobuf) : celles-ci restent toujours redéfinies en ligne.
 
 
 ## 6. Réglage des types primitifs
@@ -280,16 +321,16 @@ sens.
 
 ## 7. Procédure PVMT — à faire une fois par projet
 
-Trois informations optionnelles-mais-utiles passent par l'extension
-PVMT de Capella : le mode de streaming gRPC (§7.1, la seule des trois
+Quatre informations optionnelles-mais-utiles passent par l'extension
+PVMT de Capella : le mode de streaming gRPC (§7.1, la seule des quatre
 qui bloque l'import si absente), le `package` proto d'origine (§7.2),
-et le chemin de fichier d'origine exact (§7.3). Aucune ne peut être
-créée par script : ni Python4Capella ni `capellambse` ne le permettent
-(limite volontaire des deux outils) — c'est une configuration manuelle
-à faire une fois dans Capella, via le **PV Definition Editor**
-(sélectionnez un élément du modèle, ouvrez la vue **Property Values**
-— `Window > Show View > Other... > Property Values` — puis le PV
-Definition Editor depuis cette vue).
+le chemin de fichier d'origine exact (§7.3), et le cartouche d'en-tête
+(§7.4). Aucune ne peut être créée par script : ni Python4Capella ni
+`capellambse` ne le permettent (limite volontaire des deux outils) —
+c'est une configuration manuelle à faire une fois dans Capella, via le
+**PV Definition Editor** (sélectionnez un élément du modèle, ouvrez la
+vue **Property Values** — `Window > Show View > Other... > Property
+Values` — puis le PV Definition Editor depuis cette vue).
 
 ### 7.1 Streaming (obligatoire pour un import complet)
 
@@ -343,8 +384,25 @@ Si présente, mémorise le chemin exact du fichier `.proto` d'origine
 `Enumeration` et `Interface` créée. Utilisée par `--output-root` à
 l'export (§4, §5) pour régénérer l'arborescence avec les noms de
 fichiers exacts plutôt qu'un nom approximatif basé sur le nom de
-l'élément Capella. Absente, `--output-root` retombe sur
-`<dossier>/<NomInterface>.proto`.
+l'élément Capella, **et** pour générer un vrai `import` lors d'une
+référence croisée entre deux fichiers d'un même package plutôt que de
+redéfinir le type en double (§5) — important en mode `--all`. Absente,
+`--output-root` retombe sur `<dossier>/<NomInterface>.proto`, et les
+références croisées redeviennent inlinées comme avant.
+
+### 7.4 Cartouche d'en-tête (optionnel)
+
+| Niveau | Nom | Type |
+|---|---|---|
+| Domain | `Grpc` | — |
+| Group | `Metadata` (le même que ci-dessus) | — |
+| Property (dans Metadata) | `FileHeader` | String |
+
+Si présente, mémorise le cartouche de licence/copyright en tête de
+fichier (le bloc de commentaires séparé de `syntax = "proto3";` par une
+ligne vide, sur `Class`/`Enumeration`/`Interface`), et le régénère à
+l'identique en tête du fichier exporté. Absente, aucun cartouche n'est
+écrit à l'export, même si le fichier d'origine en avait un.
 
 
 ## 8. Ré-import : mise à jour vs duplication
@@ -383,7 +441,9 @@ sous-package) contient d'autres éléments.
   `EnumerationLiteral`) — régénérées séquentiellement depuis 0 à
   l'export. Fidèle pour un enum proto3 standard (cas courant), pas
   pour une numérotation personnalisée ou avec des trous.
-- **Imports cross-package personnalisés** : voir la limite détaillée
-  en §5 (types custom redéfinis en ligne plutôt que via un `import`
-  précis vers leur fichier d'origine).
+- **Imports cross-package personnalisés** : seules les références
+  croisées entre fichiers d'un **même** package Capella sont résolues
+  via un vrai `import` (avec `SourceFile` configuré, §7.3, §5) ; une
+  référence vers un type custom d'un package *différent* reste
+  redéfinie en ligne.
 - **`oneof`, `map<>`** : non gérés par les scripts actuels.

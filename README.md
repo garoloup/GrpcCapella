@@ -61,6 +61,20 @@ python import_proto_to_capella.py my_service.proto My_Model.aird \
     [--layer=la] [--proto-root=FOLDER] [--strict-types]
 ```
 
+Or, to process an **entire folder tree** of `.proto` files at once
+(auto-detected as soon as the first argument is a directory, not a file):
+
+```bash
+python import_proto_to_capella.py my_protos_folder/ My_Model.aird [--strict-types]
+```
+
+Recursively walks the folder, imports every `.proto` file found (in a
+stable order), a single `model.save()` at the end. `--proto-root`
+defaults to this folder if not given — generally what you want. Since
+the import is idempotent (§8), the order files are processed in
+doesn't matter: two files that reference each other converge to the
+same result either way.
+
 - `--layer`: target layer, `oa` / `sa` / `la` (default) / `pa` —
   Operational Analysis, System Analysis, Logical Architecture, Physical
   Architecture respectively. For gRPC software interfaces, `la` or `pa`
@@ -88,8 +102,10 @@ target file plus all its transitive imports, including Google's
   `rpc` and its typed input/output `Parameter`s.
 - `.proto` comments (above each message/field/enum/service/rpc) -> the
   matching Capella `description`.
+- The file header block (license/copyright, separated from the rest by
+  a blank line) -> PVMT, optional (see §7.4).
 - The streaming mode (`stream` on the request and/or the response) ->
-  PVMT (see §7).
+  PVMT (see §7.1).
 - The folder layout of your `.proto` files -> a mirrored hierarchy of
   Capella sub-packages (see §5).
 
@@ -99,7 +115,7 @@ duplicates elements already present — see §8.
 
 **Model prerequisites**, in the target layer: an existing `DataPkg`
 and `InterfacePkg` (created by default by Capella), and the streaming
-PVMT (§7, always manual — no auto-creation possible for PVMT, unlike
+PVMT (§7.1, always manual — no auto-creation possible for PVMT, unlike
 primitive types, §6).
 
 To check what was created without going back into the Capella UI:
@@ -123,30 +139,46 @@ python export_capella_to_proto.py My_Model.aird ServiceName \
     --output-root=protos [--layer=la] [--order=messages-first] [--package=my.pkg]
 ```
 
-`output.proto` (an exact path) and `--output-root` (a root folder,
-with the tree regenerated automatically underneath) are **mutually
-exclusive** — give one or the other, never both, never neither.
+or, to **export everything at once** (symmetric to the import's folder
+tree mode, §3):
+
+```bash
+python export_capella_to_proto.py My_Model.aird --all --output-root=protos [--layer=la]
+```
+
+Exports every Interface found (restricted to `--layer` if given),
+regenerating the full folder tree under `--output-root`. `--all` is
+incompatible with an Interface name or an explicit output path —
+`--output-root` is then required.
+
+`output.proto` (an exact path), `--output-root` alone, and `--all`
+(which requires `--output-root`) are **mutually exclusive** — only one
+of these three modes at a time.
 
 - `--layer`: optional, only needed to disambiguate if an Interface
-  with the same name exists in several layers (the script stops with
-  an explicit error in that case if `--layer` isn't given).
+  with the same name exists in several layers (simple mode), or to
+  restrict `--all` to a single layer.
 - `--order`: `messages-first` (default, official gRPC convention —
   detailed types first, the service last) or `service-first` (the
   service at the top of the file, a convention some teams use). Both
   orders produce a valid, recompilable `.proto`.
 - `--package`: forces the proto `package` written at the top of the
   file. Without this argument, the export tries to read it
-  automatically from the Interface's PVMT (§7); if absent on both
+  automatically from the Interface's PVMT (§7.2); if absent on both
   sides, no `package` line is written. An explicit `--package` always
-  takes priority over PVMT.
+  takes priority over PVMT. In `--all` mode, generally leave this
+  blank so each file keeps its own package via PVMT.
 
-Regenerates: `syntax = "proto3";`, the needed `import` lines
-(Google's well-known types detected automatically, see §5), the
-optional `package`, the `enum`/`message` blocks referenced
-(transitively, including through the fields of the messages
-themselves), then the `service` with its `rpc` entries (streaming
-recomputed from PVMT), and comments taken from the Capella
-`description` fields.
+Regenerates: the file header block if recorded (§7.4),
+`syntax = "proto3";`, the needed `import` lines (Google's well-known
+types detected automatically + cross-references to another file of
+the same package if `SourceFile` is configured, see §5), the optional
+`package`, the `enum`/`message` blocks referenced (transitively,
+including through the fields of the messages themselves), then the
+`service` with its `rpc` entries (streaming recomputed from PVMT), and
+comments taken from the Capella `description` fields — a comment that
+fits on a single line is realigned at the end of the code line (as in
+a hand-written `.proto`), a multi-line comment stays as a block above.
 
 
 ## 5. Capella package organization (mirrors proto folders)
@@ -210,20 +242,28 @@ python export_capella_to_proto.py Model.aird ServiceA --output-root=protos --lay
 ```
 
 The file name is chosen, in priority order: the exact original path
-if it was recorded via PVMT (`SourceFile`, §7), otherwise
+if it was recorded via PVMT (`SourceFile`, §7.3), otherwise
 `<InterfaceName>.proto` inside the folder mirroring the Capella
 package (approximate if the original `.proto` file's name differed
 from the name of the service it contained).
 
-**Known limitation**: a cross-reference to a **custom** type (not a
-Google one) living in a *different* Capella package than the exported
-Interface's own is, for now, always **redefined inline** in the
-output file rather than referenced through a precise `import`
-pointing at its exact origin file — even though that origin file may
-be known via `SourceFile` (PVMT), this mechanism isn't yet used to
-regenerate a real custom cross-file `import`. The generated file stays
-valid and self-contained (it works on its own), just not split across
-several files the way the original might be.
+**Cross-references between files of the same package**: if
+`SourceFile` (§7.3) is configured, a reference to a **custom** type
+defined in a *different* `.proto` file (even one sharing the same
+Capella package) is now correctly handled through a real
+`import "exact/path/to/ThatFile.proto";`, rather than being redefined
+inline — important in `--all` mode (§4), where several files exported
+together must remain compilable as a coherent whole (two files that
+each redefine the same message would no longer compile once
+assembled). **Without `SourceFile`** (PVMT not configured), falls back
+to the previous behavior: the type is always redefined inline — the
+generated file stays valid and self-contained on its own, but not
+necessarily so if you gather several `--all` exports of the same
+package without `SourceFile` configured.
+
+This resolution doesn't (yet) extend to cross-references between
+**different** Capella packages (distinct proto folders, outside
+google/protobuf): those are still always redefined inline.
 
 
 ## 6. Configuring primitive types
@@ -273,16 +313,16 @@ and export: a single edit covers both directions.
 
 ## 7. PVMT setup — once per project
 
-Three optional-but-useful pieces of information go through Capella's
+Four optional-but-useful pieces of information go through Capella's
 PVMT extension: the gRPC streaming mode (§7.1, the only one of the
-three that blocks the import if missing), the original proto
-`package` (§7.2), and the exact source file path (§7.3). None of these
-can be created by script: neither Python4Capella nor `capellambse`
-support it (a deliberate limitation of both tools) — it's a one-time
-manual setup in Capella, via the **PV Definition Editor** (select any
-model element, open the **Property Values** view —
-`Window > Show View > Other... > Property Values` — then the PV
-Definition Editor from that view).
+four that blocks the import if missing), the original proto
+`package` (§7.2), the exact source file path (§7.3), and the file
+header block (§7.4). None of these can be created by script: neither
+Python4Capella nor `capellambse` support it (a deliberate limitation
+of both tools) — it's a one-time manual setup in Capella, via the
+**PV Definition Editor** (select any model element, open the
+**Property Values** view — `Window > Show View > Other... > Property
+Values` — then the PV Definition Editor from that view).
 
 ### 7.1 Streaming (required for a complete import)
 
@@ -337,8 +377,26 @@ If present, records the exact original `.proto` file path (e.g.
 `service_base_api/ServiceB.proto`) on every `Class`, `Enumeration` and
 `Interface` created. Used by `--output-root` on export (§4, §5) to
 regenerate the folder tree with the exact original file names rather
-than a name approximated from the Capella element's own name. If
-absent, `--output-root` falls back to `<folder>/<InterfaceName>.proto`.
+than a name approximated from the Capella element's own name, **and**
+to generate a real `import` for a cross-reference between two files of
+the same package instead of redefining the type inline (§5) —
+important in `--all` mode. If absent, `--output-root` falls back to
+`<folder>/<InterfaceName>.proto`, and cross-references go back to
+being inlined as before.
+
+### 7.4 File header block (optional)
+
+| Level | Name | Type |
+|---|---|---|
+| Domain | `Grpc` | — |
+| Group | `Metadata` (same as above) | — |
+| Property (inside Metadata) | `FileHeader` | String |
+
+If present, records the license/copyright header block at the top of
+the file (the comment block separated from `syntax = "proto3";` by a
+blank line, on `Class`/`Enumeration`/`Interface`), and regenerates it
+verbatim at the top of the exported file. If absent, no header is
+written on export, even if the original file had one.
 
 
 ## 8. Re-importing: update vs duplication
@@ -376,7 +434,8 @@ import (pre-existing unrelated content) — expected if your `DataPkg`
   field (`EnumerationLiteral` has no `value` attribute) — regenerated
   sequentially from 0 on export. Faithful for a standard proto3 enum
   (the common case), not for custom or gapped numbering.
-- **Custom cross-package imports**: see the detailed limitation in §5
-  (custom types redefined inline rather than through a precise
-  `import` pointing at their origin file).
+- **Custom cross-package imports**: only cross-references between
+  files of the **same** Capella package are resolved through a real
+  `import` (with `SourceFile` configured, §7.3, §5); a reference to a
+  custom type in a *different* package is still redefined inline.
 - **`oneof`, `map<>`**: not handled by the current scripts.

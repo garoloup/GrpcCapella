@@ -108,3 +108,11 @@ PVMT_PACKAGE_KEY = "Grpc.Metadata.Package"
 # seul nom de l'element Capella. Optionnel, meme comportement degrade
 # que Package si absent (export retombe sur <InterfaceName>.proto).
 PVMT_SOURCE_FILE_KEY = "Grpc.Metadata.SourceFile"
+
+# PVMT optionnel (String) pour stocker le cartouche d'en-tete du
+# fichier .proto d'origine (licence/copyright, le bloc de commentaires
+# separe de "syntax = ...;" par une ligne vide -- capture via
+# leading_detached_comments sur le champ "syntax", path [12]). Meme
+# groupe Metadata, propriete String "FileHeader". Regenere en tete du
+# fichier exporte s'il est present.
+PVMT_HEADER_KEY = "Grpc.Metadata.FileHeader"
