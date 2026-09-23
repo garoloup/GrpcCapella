@@ -68,3 +68,13 @@ NUMERIC_TYPE_RANGES = {
 # PVMT : idem, un seul endroit a corriger pour les deux sens.
 PVMT_CLIENT_STREAMING_KEY = "Grpc.Streaming.ClientStreaming"
 PVMT_SERVER_STREAMING_KEY = "Grpc.Streaming.ServerStreaming"
+
+# PVMT optionnel (String) pour stocker le "package" .proto d'origine sur
+# l'Interface -- contrairement au streaming, ABSENT n'empeche PAS
+# l'import (le package reste alors seulement disponible via --package
+# a l'export). A creer manuellement dans Capella si vous le voulez :
+# meme domaine Grpc, nouveau groupe Metadata, propriete String "Package".
+# NON TESTE de bout en bout (aucune propriete String disponible dans le
+# modele de demo utilise pour les tests de ce projet) -- a valider une
+# premiere fois chez vous une fois la propriete creee.
+PVMT_PACKAGE_KEY = "Grpc.Metadata.Package"

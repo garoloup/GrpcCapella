@@ -34,6 +34,7 @@ from proto_capella_types import (
     PROTO_TO_CAPELLA_PRIMITIVE,
     PVMT_CLIENT_STREAMING_KEY,
     PVMT_SERVER_STREAMING_KEY,
+    PVMT_PACKAGE_KEY,
 )
 from setup_primitive_types import ensure_primitive_types
 
@@ -72,13 +73,35 @@ def _build_comment_index(file_proto):
     return index
 
 
-def parse_proto_file(proto_path):
+import grpc_tools
+
+
+EMPTY_TYPE_FULL_NAME = ".google.protobuf.Empty"
+
+
+def _is_empty(full_type_name):
+    return full_type_name == EMPTY_TYPE_FULL_NAME
+
+
+def parse_proto_file(proto_path, extra_include_dirs=None):
+    """
+    extra_include_dirs : repertoires -I supplementaires, pour resoudre
+    les "import" d'autres .proto (vos propres fichiers partages, par
+    exemple). Les "well-known types" Google (google/protobuf/empty.proto,
+    timestamp.proto, etc.) sont TOUJOURS inclus automatiquement, via le
+    dossier embarque par grpcio-tools -- inutile de les fournir.
+    """
     proto_path = os.path.abspath(proto_path)
     include_dir = os.path.dirname(proto_path)
+    well_known_types_dir = os.path.join(os.path.dirname(grpc_tools.__file__), "_proto")
+
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "descriptor.pb")
-        args = ["protoc", "-I" + include_dir, "--include_imports",
-                "--include_source_info", "--descriptor_set_out=" + out_path, proto_path]
+        args = ["protoc", "-I" + include_dir, "-I" + well_known_types_dir]
+        for extra_dir in (extra_include_dirs or []):
+            args.append("-I" + os.path.abspath(extra_dir))
+        args += ["--include_imports", "--include_source_info",
+                  "--descriptor_set_out=" + out_path, proto_path]
         if protoc.main(args) != 0:
             raise RuntimeError("protoc a echoue sur : %s" % proto_path)
 
@@ -88,7 +111,7 @@ def parse_proto_file(proto_path):
 
     file_proto = fds.file[-1]  # le fichier demande (les imports sont avant)
     comments = _build_comment_index(file_proto)
-    model = {"package": file_proto.package or None, "messages": [], "services": []}
+    model = {"package": file_proto.package or None, "messages": [], "enums": [], "services": []}
 
     for i, msg in enumerate(file_proto.message_type):
         fields = []
@@ -103,12 +126,32 @@ def parse_proto_file(proto_path):
             "comment": comments.get((4, i), ""),
         })
 
+    # Enums de premier niveau (path [5, i] / valeurs [5, i, 2, j] --
+    # cf. descriptor.proto : FileDescriptorProto.enum_type = champ 5).
+    # NB : les enums IMBRIQUES dans un message (nested) ne sont pas geres
+    # ici, seulement les enums declares au niveau du fichier -- limite
+    # connue, cf. README.
+    for i, en in enumerate(file_proto.enum_type):
+        values = []
+        for j, v in enumerate(en.value):
+            values.append({
+                "name": v.name, "number": v.number,
+                "comment": comments.get((5, i, 2, j), ""),
+            })
+        model["enums"].append({
+            "name": en.name, "values": values,
+            "comment": comments.get((5, i), ""),
+        })
+
     for i, svc in enumerate(file_proto.service):
         methods = []
         for j, m in enumerate(svc.method):
             methods.append({
-                "name": m.name, "input_type": _short_type(m.input_type),
+                "name": m.name,
+                "input_type": _short_type(m.input_type),
                 "output_type": _short_type(m.output_type),
+                "input_is_empty": _is_empty(m.input_type),
+                "output_is_empty": _is_empty(m.output_type),
                 "client_streaming": bool(m.client_streaming),
                 "server_streaming": bool(m.server_streaming),
                 "comment": comments.get((6, i, 2, j), ""),
@@ -118,6 +161,7 @@ def parse_proto_file(proto_path):
             "comment": comments.get((6, i), ""),
         })
 
+
     return model
 
 
@@ -125,27 +169,27 @@ def parse_proto_file(proto_path):
 # 2. Resolution des types primitifs proto -> DataType Capella existant
 # --------------------------------------------------------------------
 
-def resolve_type(type_name, data_pkg, created_classes):
-    """Cherche d'abord parmi les Classes qu'on vient de creer (types
-    message), sinon parmi les DataTypes primitifs existants du DataPkg."""
+def resolve_type(type_name, data_pkg, created_classes, created_enums=None):
+    """Cherche d'abord parmi les Classes/Enumerations qu'on vient de
+    creer (types message/enum de ce .proto), sinon parmi les DataTypes
+    primitifs existants du DataPkg."""
     if type_name in created_classes:
         return created_classes[type_name]
+    if created_enums and type_name in created_enums:
+        return created_enums[type_name]
     capella_name = PROTO_TO_CAPELLA_PRIMITIVE.get(type_name, type_name)
     try:
         return data_pkg.data_types.by_name(capella_name)
     except KeyError:
-        print("ATTENTION : type primitif '%s' (-> '%s') introuvable dans "
-              "le DataPkg, le champ/parametre restera sans type." %
-              (type_name, capella_name))
+        print("ATTENTION : type '%s' (-> '%s') introuvable (ni message/enum "
+              "de ce .proto, ni DataType primitif) : le champ/parametre "
+              "restera sans type." % (type_name, capella_name))
         return None
 
 
 # --------------------------------------------------------------------
 # 3. Creation des elements Capella
 # --------------------------------------------------------------------
-
-def import_proto_model(proto_model, data_pkg, interface_pkg):
-    created_classes = {}
 
 def _get_or_create(collection, name, typehint=None, **create_kwargs):
     """Cherche un element par nom dans la collection ; le cree s'il
@@ -162,9 +206,29 @@ def _get_or_create(collection, name, typehint=None, **create_kwargs):
 
 def import_proto_model(proto_model, data_pkg, interface_pkg):
     created_classes = {}
+    created_enums = {}
     stats = {"created": 0, "updated": 0}
     proto_message_names = {m["name"] for m in proto_model["messages"]}
-    proto_service_names = {s["name"] for s in proto_model["services"]}
+    package_stored = False
+    package_pvmt_missing = False
+
+    # Enums -> Enumeration (+ EnumerationLiteral), AVANT les Classes qui
+    # peuvent les referencer dans leurs champs.
+    # LIMITE : Capella ne stocke pas de valeur numerique explicite par
+    # litteral -- on suppose donc un enum proto3 standard, sequentiel a
+    # partir de 0 (le cas courant). Un enum avec des numeros customises/
+    # non contigus perdra cette numerotation au re-export (regenere
+    # sequentiellement). A affiner si vous en avez besoin.
+    for en in proto_model["enums"]:
+        capella_enum, is_new = _get_or_create(data_pkg.enumerations, en["name"])
+        stats["created" if is_new else "updated"] += 1
+        if en["comment"]:
+            capella_enum.description = en["comment"]
+        for value in en["values"]:
+            lit, _ = _get_or_create(capella_enum.owned_literals, value["name"])
+            if value["comment"]:
+                lit.description = value["comment"]
+        created_enums[en["name"]] = capella_enum
 
     # Messages -> Classes (find-or-create par nom)
     for msg in proto_model["messages"]:
@@ -174,7 +238,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
             capella_class.description = msg["comment"]
         created_classes[msg["name"]] = capella_class
 
-    # deuxieme passe : les champs, une fois que toutes les Classes
+    # deuxieme passe : les champs, une fois que toutes les Classes/Enums
     # existent (pour resoudre les references de type message a message)
     for msg in proto_model["messages"]:
         capella_class = created_classes[msg["name"]]
@@ -184,7 +248,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
             prop, _ = _get_or_create(capella_class.owned_properties, field["name"])
             if field["comment"]:
                 prop.description = field["comment"]
-            field_type = resolve_type(field["type"], data_pkg, created_classes)
+            field_type = resolve_type(field["type"], data_pkg, created_classes, created_enums)
             if field_type is not None:
                 prop.type = field_type
 
@@ -212,6 +276,16 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
         if svc["comment"]:
             capella_interface.description = svc["comment"]
 
+        # Package proto -> PVMT (optionnel, n'empeche pas l'import si
+        # absent -- contrairement au streaming). Signale une seule fois
+        # au niveau du modele (voir plus bas) si le groupe n'existe pas.
+        if proto_model["package"]:
+            try:
+                capella_interface.pvmt[PVMT_PACKAGE_KEY] = proto_model["package"]
+                package_stored = True
+            except KeyError:
+                package_pvmt_missing = True
+
         proto_method_names = {m["name"] for m in svc["methods"]}
 
         for method in svc["methods"]:
@@ -220,14 +294,33 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
             if method["comment"]:
                 operation.description = method["comment"]
 
-            in_type = resolve_type(method["input_type"], data_pkg, created_classes)
-            out_type = resolve_type(method["output_type"], data_pkg, created_classes)
-            in_param, _ = _get_or_create(operation.parameters, "request", direction="IN")
-            out_param, _ = _get_or_create(operation.parameters, "response", direction="OUT")
-            if in_type is not None:
-                in_param.type = in_type
-            if out_type is not None:
-                out_param.type = out_type
+            # google.protobuf.Empty : PAS de Parameter cree du tout pour
+            # ce cote-la (entree et/ou sortie) -- l'absence de Parameter
+            # EST l'encodage de "Empty" ; l'export saura le regenerer.
+            # Si un Parameter "request"/"response" existe deja d'un import
+            # precedent (avant ce fix) alors que le .proto dit maintenant
+            # Empty, on le retire pour rester coherent avec la source.
+            if method["input_is_empty"]:
+                try:
+                    operation.parameters.remove(operation.parameters.by_name("request"))
+                except KeyError:
+                    pass
+            else:
+                in_type = resolve_type(method["input_type"], data_pkg, created_classes, created_enums)
+                in_param, _ = _get_or_create(operation.parameters, "request", direction="IN")
+                if in_type is not None:
+                    in_param.type = in_type
+
+            if method["output_is_empty"]:
+                try:
+                    operation.parameters.remove(operation.parameters.by_name("response"))
+                except KeyError:
+                    pass
+            else:
+                out_type = resolve_type(method["output_type"], data_pkg, created_classes, created_enums)
+                out_param, _ = _get_or_create(operation.parameters, "response", direction="OUT")
+                if out_type is not None:
+                    out_param.type = out_type
 
             # Streaming -> PVMT (necessite que le domaine/groupe existe deja)
             try:
@@ -249,6 +342,16 @@ def import_proto_model(proto_model, data_pkg, interface_pkg):
     if orphan_classes:
         print(f"INFO : le DataPkg contient d'autres Classes non references "
               f"par ce .proto : {', '.join(orphan_classes)}")
+    if proto_model["package"]:
+        if package_stored:
+            print(f"INFO : package proto '{proto_model['package']}' stocke via PVMT "
+                  f"({PVMT_PACKAGE_KEY}) sur l'Interface.")
+        if package_pvmt_missing:
+            domain_name, group_name = PVMT_PACKAGE_KEY.split(".")[0:2]
+            print(f"INFO : package proto '{proto_model['package']}' NON stocke -- le "
+                  f"groupe PVMT '{domain_name}.{group_name}' n'existe pas dans ce modele "
+                  f"(optionnel, cf. proto_capella_types.py). Repassez-le a l'export avec "
+                  f"--package si besoin.")
 
     print(f"Bilan : {stats['created']} element(s) cree(s), "
           f"{stats['updated']} element(s) deja existant(s) mis a jour.")
