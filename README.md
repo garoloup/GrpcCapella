@@ -95,7 +95,11 @@ What the script processes, across **every** file it encounters (the
 target file plus all its transitive imports, including Google's
 "well-known types" such as `google/protobuf/empty.proto`):
 
-- A `message` -> a `Class`, with its fields as `Property`.
+- A `message` -> a `Class`, with its fields as `Property`; a nested
+  message -> a nested `Class`.
+- A `map<K, V>` -> a nested `Class` `NameEntry` (`key`, `value`) and a
+  `0..*` field; `repeated` -> `0..*`; `optional` -> `0..1`; a `oneof`
+  field -> PVMT `Oneof` (§7.6).
 - A top-level `enum` -> a Capella `Enumeration`, with its values as
   `EnumerationLiteral` (not enums nested inside a message — known
   limitation, §9).
@@ -128,58 +132,72 @@ python verify_import.py My_Model.aird ServiceName
 
 ## 4. Usage — Export: Capella -> `.proto`
 
-```bash
-python export_capella_to_proto.py My_Model.aird ServiceName output.proto \
-    [--layer=la] [--order=messages-first] [--package=my.pkg]
-```
-
-or, to regenerate the folder tree automatically (see §5):
-
-```bash
-python export_capella_to_proto.py My_Model.aird ServiceName \
-    --output-root=protos [--layer=la] [--order=messages-first] [--package=my.pkg]
-```
-
-or, to **export everything at once** (symmetric to the import's folder
-tree mode, §3):
+Export regenerates **complete `.proto` files**, structurally identical to
+the originals: each file is rebuilt from the Classes, Enumerations and
+Interfaces that came from it (PVMT `SourceFile`, §7.3). This covers files
+**without any service** (types only) as well as files with **several
+services**.
 
 ```bash
+# the whole model, folder tree regenerated under protos/
 python export_capella_to_proto.py My_Model.aird --all --output-root=protos [--layer=la]
+
+# one specific file, by its original path (useful for a file with no service)
+python export_capella_to_proto.py My_Model.aird --file soba_function_api/common.proto --output-root=protos
+
+# the file containing a given service (the WHOLE file, all its services)
+python export_capella_to_proto.py My_Model.aird ServiceName --output-root=protos
+python export_capella_to_proto.py My_Model.aird ServiceName output.proto
 ```
 
-Exports every Interface found (restricted to `--layer` if given),
-regenerating the full folder tree under `--output-root`. `--all` is
-incompatible with an Interface name or an explicit output path —
-`--output-root` is then required.
+One mode at a time: an Interface name, `--file` or `--all`. `--all`
+requires `--output-root`; the other modes take either `--output-root` or
+an explicit output path.
 
-`output.proto` (an exact path), `--output-root` alone, and `--all`
-(which requires `--output-root`) are **mutually exclusive** — only one
-of these three modes at a time.
+- `--layer`: restricts to one layer (and disambiguates an Interface name
+  that exists in several layers).
+- `--order`: `messages-first` (default: enums, then messages, then
+  services) or `service-first`.
+- `--package`: forces the `package` written. Without it, it is read back
+  from PVMT (§7.2). In `--all` mode, leave it blank.
 
-- `--layer`: optional, only needed to disambiguate if an Interface
-  with the same name exists in several layers (simple mode), or to
-  restrict `--all` to a single layer.
-- `--order`: `messages-first` (default, official gRPC convention —
-  detailed types first, the service last) or `service-first` (the
-  service at the top of the file, a convention some teams use). Both
-  orders produce a valid, recompilable `.proto`.
-- `--package`: forces the proto `package` written at the top of the
-  file. Without this argument, the export tries to read it
-  automatically from the Interface's PVMT (§7.2); if absent on both
-  sides, no `package` line is written. An explicit `--package` always
-  takes priority over PVMT. In `--all` mode, generally leave this
-  blank so each file keeps its own package via PVMT.
+**Interfaces without `SourceFile`** (model Interfaces unrelated to gRPC,
+or imported before this mechanism): **skipped by `--all`**, with a message
+giving their count. `--include-legacy` exports them the old way (the
+service plus the types it references, redefined in
+`<InterfaceName>.proto`). When named explicitly, such an Interface is
+always exported the old way.
 
-Regenerates: the file header block if recorded (§7.4),
-`syntax = "proto3";`, the needed `import` lines (Google's well-known
-types detected automatically + cross-references to another file of
-the same package if `SourceFile` is configured, see §5), the optional
-`package`, the `enum`/`message` blocks referenced (transitively,
-including through the fields of the messages themselves), then the
-`service` with its `rpc` entries (streaming recomputed from PVMT), and
-comments taken from the Capella `description` fields — a comment that
-fits on a single line is realigned at the end of the code line (as in
-a hand-written `.proto`), a multi-line comment stays as a block above.
+`--all` can be used without `--layer`: elements outside the scope of the
+`Metadata` PVMT group (e.g. Operational Analysis classes) are simply
+skipped.
+
+Regenerated content, in order: header (§7.4), `syntax`, `import`,
+`package`, enums, messages, services. Inside messages:
+
+| Proto | Capella representation | Regenerated as |
+|---|---|---|
+| nested message | nested `Class` (`nested_classes`) | nested `message` |
+| `map<K, V> name` | nested `Class` `NameEntry` (`key`, `value`), field `0..*` — `protoc`'s own internal representation | `map<K, V> name` |
+| `repeated` | cardinality `0..*` | `repeated` |
+| `optional` | cardinality `0..1` | `optional` |
+| `oneof group { ... }` | PVMT `Oneof` = `group` on each field (§7.6) | `oneof` block |
+| `google.protobuf.Any`, `Empty`, `Timestamp`... | `Class` in the `google/protobuf` package | qualified name + standard `import` |
+
+**Naming and imports**, as in hand-written `.proto` files:
+
+- type from the **same package** -> short name (`TypeA`); from inside a
+  message, a nested type is named relatively (`Inner` rather than
+  `Features.Inner`). If a short name is shadowed by a nested message of
+  the same name, the fully qualified name (`.pkg.Type`) is used;
+- type from **another package** -> qualified name (`soba_function_api.TypeA`);
+- type defined in **another file** -> `import` of that file: bare file
+  name if it lives in the **same folder** (`import "serviceA.proto";`),
+  path from the proto root otherwise (`import "soba_function_api/serviceA.proto";`).
+
+Comments are restored in their original style (§7.5): single-line ones at
+the end of the code line (column-aligned), multi-line ones above the
+element.
 
 
 ## 5. Capella package organization (mirrors proto folders)
@@ -228,6 +246,13 @@ export, these specific types are detected automatically (by checking
 their Capella package is `google/protobuf`) and referenced through a
 real `import "google/protobuf/xxx.proto";`, never redefined inline.
 
+**Imports between sibling files**: an import written without a folder
+(`import "serviceA.proto";` from a file in the same folder) is correctly
+attached to that folder's Capella package. The folder is computed from
+the file's real path on disk, not from the import name used by
+`protoc`. Without this, the types of `serviceA.proto` would be created
+twice (at the root of `Data` and in the sub-package).
+
 **Mismatch warning**: if a file's real folder doesn't match its
 internal `package X.Y;` declaration (expected folder = the package
 name with dots replaced by `/`), the import prints an explicit
@@ -248,23 +273,13 @@ if it was recorded via PVMT (`SourceFile`, §7.3), otherwise
 package (approximate if the original `.proto` file's name differed
 from the name of the service it contained).
 
-**Cross-references between files of the same package**: if
-`SourceFile` (§7.3) is configured, a reference to a **custom** type
-defined in a *different* `.proto` file (even one sharing the same
-Capella package) is now correctly handled through a real
-`import "exact/path/to/ThatFile.proto";`, rather than being redefined
-inline — important in `--all` mode (§4), where several files exported
-together must remain compilable as a coherent whole (two files that
-each redefine the same message would no longer compile once
-assembled). **Without `SourceFile`** (PVMT not configured), falls back
-to the previous behavior: the type is always redefined inline — the
-generated file stays valid and self-contained on its own, but not
-necessarily so if you gather several `--all` exports of the same
-package without `SourceFile` configured.
-
-This resolution doesn't (yet) extend to cross-references between
-**different** Capella packages (distinct proto folders, outside
-google/protobuf): those are still always redefined inline.
+**References between files**: with `SourceFile` configured (§7.3), each
+file is regenerated with its own types only, and references those of
+other files through a real `import` (same folder or not, same package or
+not), with the naming described in §4. Several files exported together
+therefore remain compilable as a whole, with no type defined twice.
+**Without `SourceFile`**, falls back to the old per-Interface mode (types
+redefined inline).
 
 
 ## 6. Configuring primitive types
@@ -314,11 +329,12 @@ and export: a single edit covers both directions.
 
 ## 7. PVMT setup — once per project
 
-Five optional-but-useful pieces of information go through Capella's
+Six optional-but-useful pieces of information go through Capella's
 PVMT extension: the gRPC streaming mode (§7.1, the only one of the
-five that blocks the import if missing), the original proto
+six that blocks the import if missing), the original proto
 `package` (§7.2), the exact source file path (§7.3), the file header
-block (§7.4), and the comment style (§7.5). None of these can be created by script: neither
+block (§7.4), the comment style (§7.5), and `oneof` membership
+(§7.6). None of these can be created by script: neither
 Python4Capella nor `capellambse` support it (a deliberate limitation
 of both tools) — it's a one-time manual setup in Capella, via the
 **PV Definition Editor** (select any model element, open the
@@ -432,6 +448,23 @@ gap: inside a boxed comment, padding spaces beyond the longest line are
 not preserved (the `*/` stay aligned with each other).
 
 
+### 7.6 `oneof` groups (optional)
+
+| Level | Name | Type |
+|---|---|---|
+| Domain | `Grpc` | — |
+| Group | `Metadata` (same as above) | — |
+| Property (inside Metadata) | `Oneof` | String |
+
+Holds, on each field (`Property`) that belongs to a `oneof`, the group's
+name (e.g. `choice`). Export gathers fields sharing that value into a
+`oneof choice { ... }` block. The synthetic `oneof`s that `protoc` creates
+for `optional` are not involved: `optional` goes through the `0..1`
+cardinality. **If absent**, `oneof` fields are exported as plain fields
+(valid file, but mutual exclusivity is lost); the import flags it with an
+`ATTENTION`.
+
+
 ## 8. Re-importing: update vs duplication
 
 The import is **idempotent**, by name, within each Capella package
@@ -457,14 +490,17 @@ import (pre-existing unrelated content) — expected if your `DataPkg`
 
 ## 9. Known limitations
 
-- **Nested enums**: only `enum`s declared at file level are handled,
-  not ones nested inside a `message`.
-- **Enum numeric values**: Capella has no explicit per-literal value
-  field (`EnumerationLiteral` has no `value` attribute) — regenerated
-  sequentially from 0 on export. Faithful for a standard proto3 enum
-  (the common case), not for custom or gapped numbering.
-- **Custom cross-package imports**: only cross-references between
-  files of the **same** Capella package are resolved through a real
-  `import` (with `SourceFile` configured, §7.3, §5); a reference to a
-  custom type in a *different* package is still redefined inline.
-- **`oneof`, `map<>`**: not handled by the current scripts.
+- **Field numbers are renumbered (important)**: the original numbers
+  (`= 5`) are not stored in Capella. Export renumbers fields 1, 2, 3… in
+  declaration order. That is faithful for a gap-free file, but **breaks
+  wire compatibility** if the original has gaps, removed fields, or a
+  different order. Same for enum values, regenerated from 0. To be
+  addressed first, before any production use.
+- **Enums nested inside a message**: not handled (Capella does not allow
+  an `Enumeration` inside a `Class`); flagged with an `ATTENTION`, fields
+  of that type are left untyped.
+- **`reserved` and options** (`[deprecated = true]`, `option java_package`…):
+  not preserved.
+- **Formatting**: the column of end-of-line comments is recomputed,
+  multiple blank lines are normalized, and enums are placed before
+  messages.

@@ -50,12 +50,14 @@ LIMITES CONNUES (fidelite du round-trip) :
 
 import sys
 import os
+import posixpath
 import argparse
 import html
 import capellambse
 import proto_comments
 
 from proto_capella_types import (
+    pvmt_get,
     CAPELLA_TO_PROTO_PRIMITIVE,
     PVMT_STREAMING_MODE_KEY,
     STREAMING_MODE_TO_FLAGS,
@@ -63,6 +65,7 @@ from proto_capella_types import (
     PVMT_SOURCE_FILE_KEY,
     PVMT_HEADER_KEY,
     PVMT_COMMENT_STYLE_KEY,
+    PVMT_ONEOF_KEY,
 )
 
 LAYER_CHOICES = {"oa": "Operational Analysis", "sa": "System Analysis",
@@ -130,7 +133,7 @@ def get_comment_style(element):
     """Style de commentaire d'origine (PVMT CommentStyle, cf.
     proto_comments.py), "//" par defaut si absent/non configure."""
     try:
-        style = element.pvmt[PVMT_COMMENT_STYLE_KEY]
+        style = pvmt_get(element, PVMT_COMMENT_STYLE_KEY)
     except KeyError:
         return proto_comments.DEFAULT_STYLE
     return style if style in proto_comments.KNOWN_STYLES else proto_comments.DEFAULT_STYLE
@@ -219,10 +222,13 @@ def enum_to_proto(enum):
     return "\n".join(lines)
 
 
-def interface_to_proto_service(interface, needed_imports):
+def interface_to_proto_service(interface, needed_imports, type_namer=None):
     """needed_imports : set mutable, alimente si un well-known type
     Google est rencontre (pour que l'appelant sache quels 'import'
-    ecrire)."""
+    ecrire). type_namer : fonction capella_type -> nom proto (export par
+    fichier : qualification pkg.Type et imports inter-fichiers) ; par
+    defaut proto_type_name (ancien mode par Interface)."""
+    namer = type_namer or (lambda t: proto_type_name(t, needed_imports))
     lines = _as_comment_lines(interface)
     lines.append(f"service {interface.name} {{")
     first_method = True
@@ -237,22 +243,20 @@ def interface_to_proto_service(interface, needed_imports):
         in_param = next((p for p in op.parameters if str(p.direction) == "IN"), None)
         out_param = next((p for p in op.parameters if str(p.direction) == "OUT"), None)
 
-        in_type = proto_type_name(in_param.type, needed_imports) if in_param else None
+        in_type = namer(in_param.type) if in_param else None
         if in_type is None:
             lines.append(f"    // ATTENTION : type d'entree non resolu pour '{op.name}'")
             in_type = "bytes"
 
-        out_type = proto_type_name(out_param.type, needed_imports) if out_param else None
+        out_type = namer(out_param.type) if out_param else None
         if out_type is None:
             lines.append(f"    // ATTENTION : type de sortie non resolu pour '{op.name}'")
             out_type = "bytes"
 
-        try:
-            mode_literal = op.pvmt[PVMT_STREAMING_MODE_KEY]
-            client_streaming, server_streaming = STREAMING_MODE_TO_FLAGS.get(
-                mode_literal.name, (False, False))
-        except KeyError:
-            client_streaming = server_streaming = False
+        mode_literal = pvmt_get(op, PVMT_STREAMING_MODE_KEY)
+        mode_name = getattr(mode_literal, "name", None)  # None si non renseigne
+        client_streaming, server_streaming = STREAMING_MODE_TO_FLAGS.get(
+            mode_name, (False, False))
 
         in_stream = "stream " if client_streaming else ""
         out_stream = "stream " if server_streaming else ""
@@ -269,7 +273,7 @@ def get_type_source_file(element):
     Enumeration/Interface) ; None si absent (PVMT non configure ou
     element importe avant l'ajout de ce mecanisme)."""
     try:
-        return element.pvmt[PVMT_SOURCE_FILE_KEY] or None
+        return pvmt_get(element, PVMT_SOURCE_FILE_KEY) or None
     except KeyError:
         return None
 
@@ -381,13 +385,13 @@ def export_interface_to_proto(interface, referenced_classes=None, referenced_enu
 
     if package is None:
         try:
-            package = interface.pvmt[PVMT_PACKAGE_KEY] or None
+            package = pvmt_get(interface, PVMT_PACKAGE_KEY) or None
         except KeyError:
             package = None
 
     file_header = None
     try:
-        file_header = interface.pvmt[PVMT_HEADER_KEY] or None
+        file_header = pvmt_get(interface, PVMT_HEADER_KEY) or None
     except KeyError:
         pass
 
@@ -431,6 +435,277 @@ def export_interface_to_proto(interface, referenced_classes=None, referenced_enu
     return "\n".join(header + body)
 
 
+# ======================================================================
+# Export PAR FICHIER (necessite le PVMT SourceFile)
+# ----------------------------------------------------------------------
+# Regroupe Classes, Enumerations et Interfaces par fichier .proto
+# d'origine et regenere chaque fichier EN ENTIER. Seule facon correcte de
+# traiter : les fichiers sans service (types seuls), les fichiers a
+# plusieurs services (sinon chaque Interface ecraserait l'autre, meme
+# SourceFile), et les references entre fichiers (import + nommage).
+# ======================================================================
+
+def _pvmt_str(element, key):
+    try:
+        value = pvmt_get(element, key)
+    except KeyError:
+        return None
+    return value or None
+
+
+def _top_owner(capella_type):
+    """Class/Enumeration de niveau fichier qui contient ce type (lui-meme
+    s'il n'est pas imbrique) -- c'est elle qui porte SourceFile/Package."""
+    t = capella_type
+    while type(t.parent).__name__ == "Class":
+        t = t.parent
+    return t
+
+
+def _dotted_name(capella_type):
+    """Nom relatif au package proto : 'Outer.Inner' pour un message imbrique."""
+    names = [capella_type.name]
+    t = capella_type
+    while type(t.parent).__name__ == "Class":
+        t = t.parent
+        names.insert(0, t.name)
+    return ".".join(names)
+
+
+def _type_package(capella_type):
+    """Package proto d'un type : PVMT Package (pose a l'import sur les
+    Class/Enumeration), sinon deduit du dossier (convention dossier ==
+    package, '/' -> '.')."""
+    owner = _top_owner(capella_type)
+    pkg = _pvmt_str(owner, PVMT_PACKAGE_KEY)
+    if pkg:
+        return pkg
+    folder = get_capella_type_folder(owner.parent)
+    return folder.replace("/", ".") or None
+
+
+def _import_path(target_file, from_file):
+    """Directive import vers target_file depuis from_file : fichier du
+    MEME dossier -> nom de fichier seul (convention de vos .proto :
+    import "serviceA.proto";), sinon chemin depuis la racine proto."""
+    if posixpath.dirname(target_file) == posixpath.dirname(from_file):
+        return posixpath.basename(target_file)
+    return target_file
+
+
+def make_type_namer(file_path, file_package, imports):
+    """Fonction capella_type -> nom proto, pour un fichier donne :
+      - primitif           -> mot-cle proto (int32, string...)
+      - well-known Google  -> google.protobuf.X + import standard
+      - meme package       -> nom court (TypeA, ou Outer.Inner)
+      - autre package      -> nom qualifie (autre_pkg.TypeA)
+      - defini dans un autre fichier -> + import de ce fichier
+    imports : set alimente au fil de l'eau."""
+    def namer(capella_type, scope=None):
+        if capella_type is None:
+            return None
+        if is_well_known_google_type(capella_type):
+            return proto_type_name(capella_type, imports)
+        if type(capella_type).__name__ not in ("Class", "Enumeration"):
+            return CAPELLA_TO_PROTO_PRIMITIVE.get(capella_type.name, capella_type.name)
+        owner_file = get_type_source_file(_top_owner(capella_type))
+        if owner_file and owner_file != file_path:
+            imports.add(_import_path(owner_file, file_path))
+        dotted = _dotted_name(capella_type)
+        pkg = _type_package(capella_type)
+        if pkg and file_package and pkg != file_package:
+            return f"{pkg}.{dotted}"
+        return _relative_to_scope(capella_type, scope, pkg)
+    return namer
+
+
+def _class_chain(capella_type):
+    """[englobante de niveau fichier, ..., capella_type]"""
+    chain = [capella_type]
+    while type(chain[0].parent).__name__ == "Class":
+        chain.insert(0, chain[0].parent)
+    return chain
+
+
+def _relative_to_scope(capella_type, scope, pkg):
+    """Nom le plus court valide depuis le message 'scope' (Class Capella
+    dans laquelle le champ est ecrit), comme dans un .proto ecrit a la
+    main : 'Inner' plutot que 'Features.Inner' depuis Features.
+    Masquage : si un message imbrique d'un scope intermediaire porte le
+    meme nom que le debut du nom court, protoc le trouverait en premier
+    -> nom pleinement qualifie '.pkg.Type' (toujours sans ambiguite)."""
+    target = _class_chain(capella_type)
+    if scope is None:
+        return ".".join(t.name for t in target)
+    scope_chain = _class_chain(scope)
+    k = 0
+    while (k < len(target) - 1 and k < len(scope_chain)
+           and target[k].uuid == scope_chain[k].uuid):
+        k += 1
+    candidate = [t.name for t in target[k:]]
+    for enclosing in scope_chain[k:]:
+        for nested in enclosing.nested_classes:
+            if nested.name == candidate[0] and nested.uuid != target[k].uuid:
+                full = ".".join(t.name for t in target)
+                return f".{pkg}.{full}" if pkg else f".{full}"
+    return ".".join(candidate)
+
+
+def _map_entry_name(field_name):
+    """Nom du message genere par protoc pour 'map<K,V> field_name' :
+    CamelCase + 'Entry' (ex: event_list -> EventListEntry)."""
+    parts = field_name.split("_")
+    return "".join(p[:1].upper() + p[1:] for p in parts if p) + "Entry"
+
+
+def _as_map_entry(prop, owner_cls):
+    """Si prop est un champ map, retourne sa Class d'entree (imbriquee
+    dans owner_cls, nommee <Champ>Entry, proprietes key/value), sinon None."""
+    t = prop.type
+    if (t is None or type(t).__name__ != "Class" or t.parent is None
+            or getattr(t.parent, "uuid", None) != owner_cls.uuid
+            or t.name != _map_entry_name(prop.name) or not is_repeated(prop)):
+        return None
+    names = [p.name for p in t.owned_properties]
+    return t if names == ["key", "value"] else None
+
+
+def _is_optional(prop):
+    return (prop.min_card is not None and prop.max_card is not None
+            and prop.min_card.value == "0" and prop.max_card.value == "1")
+
+
+def class_to_proto_message_v2(cls, namer, indent=""):
+    """Message complet : messages imbriques (hors entrees de map), puis
+    champs -- map<K, V>, optional, repeated, et groupes oneof (PVMT
+    Oneof). Commentaires dans leur style d'origine, fin de ligne alignee."""
+    inner = indent + "    "
+    lines = _as_comment_lines(cls, indent)
+    lines.append(f"{indent}message {cls.name} {{")
+
+    map_entries = {}
+    for prop in cls.owned_properties:
+        entry = _as_map_entry(prop, cls)
+        if entry is not None:
+            map_entries[entry.uuid] = entry
+    for nested in cls.nested_classes:
+        if nested.uuid in map_entries:
+            continue  # regenere sous forme map<K, V>, pas comme message
+        lines.append(class_to_proto_message_v2(nested, namer, inner))
+        lines.append("")
+
+    def field_line(prop, number, ind):
+        entry = _as_map_entry(prop, cls)
+        extra = []
+        if entry is not None:
+            k, v = entry.owned_properties
+            kt, vt = namer(k.type, cls) or "string", namer(v.type, cls) or "bytes"
+            return f"{ind}map<{kt}, {vt}> {prop.name} = {number};", extra
+        type_name = namer(prop.type, cls)
+        if type_name is None:
+            extra = [f"{ind}// ATTENTION : type non resolu pour ce champ -- verifiez le modele"]
+            type_name = "bytes"
+        label = "repeated " if is_repeated(prop) else ("optional " if _is_optional(prop) else "")
+        return f"{ind}{label}{type_name} {prop.name} = {number};", extra
+
+    pending, emitted_oneofs = [], set()
+    props = list(cls.owned_properties)
+    numbers = {p.uuid: n for n, p in enumerate(props, start=1)}
+    for prop in props:
+        oneof = _pvmt_str(prop, PVMT_ONEOF_KEY)
+        if not oneof:
+            code, extra = field_line(prop, numbers[prop.uuid], inner)
+            pending.append((code, prop, extra))
+            continue
+        if oneof in emitted_oneofs:
+            continue
+        emitted_oneofs.add(oneof)
+        lines.extend(_emit_aligned_block(pending)); pending = []
+        members = [p for p in props if _pvmt_str(p, PVMT_ONEOF_KEY) == oneof]
+        lines.append(f"{inner}oneof {oneof} {{")
+        block = []
+        for m in members:
+            code, extra = field_line(m, numbers[m.uuid], inner + "    ")
+            block.append((code, m, extra))
+        lines.extend(_emit_aligned_block(block))
+        lines.append(f"{inner}}}")
+    lines.extend(_emit_aligned_block(pending))
+    lines.append(f"{indent}}}")
+    return "\n".join(lines)
+
+
+def _in_layer(element, layer_uuid):
+    return layer_uuid is None or element.layer.uuid == layer_uuid
+
+
+def collect_files(model, layer_code=None):
+    """{SourceFile: {"classes": [...], "enums": [...], "interfaces": [...]}}
+    pour tous les elements de niveau fichier portant un SourceFile (hors
+    well-known types Google, jamais regeneres). Ordre = ordre du modele
+    (= ordre de declaration d'origine, les elements etant crees dans
+    l'ordre du fichier a l'import)."""
+    layer_uuid = getattr(model, layer_code).uuid if layer_code else None
+    files = {}
+
+    def add(kind, element):
+        if not _in_layer(element, layer_uuid):
+            return
+        src = get_type_source_file(element)
+        if not src or src.startswith(WELL_KNOWN_GOOGLE_FOLDER + "/"):
+            return
+        files.setdefault(src, {"classes": [], "enums": [], "interfaces": []})[kind].append(element)
+
+    for c in model.search("Class"):
+        if type(c.parent).__name__ != "Class":  # les imbriquees suivent leur englobante
+            add("classes", c)
+    for e in model.search("Enumeration"):
+        add("enums", e)
+    for i in model.search("Interface"):
+        add("interfaces", i)
+    return files
+
+
+def export_file_to_proto(file_path, content, order="messages-first", package=None):
+    """Regenere un fichier .proto complet : cartouche, syntax, imports,
+    package, enums, messages, puis services (0, 1 ou plusieurs)."""
+    if order not in ("messages-first", "service-first"):
+        raise ValueError('order doit etre "messages-first" ou "service-first"')
+    elements = content["enums"] + content["classes"] + content["interfaces"]
+    if package is None:
+        package = next((p for p in (_pvmt_str(e, PVMT_PACKAGE_KEY) for e in elements) if p), None)
+    file_header = next((h for h in (_pvmt_str(e, PVMT_HEADER_KEY) for e in elements) if h), None)
+
+    imports = set()
+    namer = make_type_namer(file_path, package, imports)
+    type_blocks = []
+    for en in content["enums"]:
+        type_blocks += [enum_to_proto(en), ""]
+    for cls in content["classes"]:
+        type_blocks += [class_to_proto_message_v2(cls, namer), ""]
+    service_blocks = []
+    for iface in content["interfaces"]:
+        service_blocks += [interface_to_proto_service(iface, imports, namer), ""]
+
+    header = []
+    if file_header:
+        header.extend(proto_comments.render_header(file_header))
+    header.append('syntax = "proto3";')
+    for imp_path in sorted(imports, key=lambda x: (not x.startswith("google/"), x)):
+        header.append(f'import "{imp_path}";')
+    if package:
+        header.append(f"package {package};")
+    header.append("")
+
+    if order == "messages-first":
+        body = type_blocks + service_blocks
+    else:
+        body = service_blocks + type_blocks
+    while body and body[-1] == "":
+        body.pop()
+    return "\n".join(header + body) + "\n"
+
+
+
 def find_interface(model, interface_name, layer_code=None):
     candidates = [i for i in model.search("Interface") if i.name == interface_name]
     if not candidates:
@@ -457,7 +732,7 @@ def compute_output_path(interface, output_root):
       <InterfaceName>.proto (approximatif : le nom de fichier n'est pas
       garanti correspondre a l'original, cf. limite documentee)."""
     try:
-        source_file = interface.pvmt[PVMT_SOURCE_FILE_KEY]
+        source_file = pvmt_get(interface, PVMT_SOURCE_FILE_KEY)
         if source_file:
             return os.path.join(output_root, source_file)
     except KeyError:
@@ -467,95 +742,127 @@ def compute_output_path(interface, output_root):
     return os.path.join(output_root, folder, filename) if folder else os.path.join(output_root, filename)
 
 
+def _write(path, text):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text if text.endswith("\n") else text + "\n")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Export Capella Interface(s) -> .proto")
+    parser = argparse.ArgumentParser(description="Export Capella -> .proto")
     parser.add_argument("model_path", help="Chemin vers le fichier .aird du modele Capella")
     parser.add_argument("interface_name", nargs="?", default=None,
-                         help="Nom de l'Interface Capella a exporter. Omis si --all.")
+                         help="Nom de l'Interface Capella a exporter (exporte TOUT le fichier "
+                              ".proto qui la contient si SourceFile est connu). Omis avec --all/--file.")
     parser.add_argument("output_path", nargs="?", default=None,
                          help="Fichier .proto de sortie (chemin exact). Incompatible avec "
-                              "--output-root et --all -- utilisez l'un ou l'autre.")
+                              "--output-root.")
     parser.add_argument("--output-root", default=None,
-                         help="Dossier racine : le fichier est ecrit automatiquement dans "
-                              "<output-root>/<dossier miroir du package Capella>/"
-                              "<InterfaceName>.proto (les dossiers manquants sont crees). "
-                              "Incompatible avec output_path. Obligatoire avec --all.")
+                         help="Dossier racine : chaque fichier est ecrit sous "
+                              "<output-root>/<chemin d'origine> (SourceFile), ou "
+                              "<output-root>/<dossier>/<InterfaceName>.proto a defaut. "
+                              "Obligatoire avec --all.")
     parser.add_argument("--all", action="store_true",
-                         help="Exporte TOUTES les Interfaces trouvees (dans la couche "
-                              "--layer si precisee, sinon dans tout le modele), en "
-                              "regenerant l'arborescence complete sous --output-root "
-                              "(obligatoire dans ce mode). Symetrique du mode arborescence "
-                              "de l'import.")
+                         help="Exporte TOUS les fichiers .proto du modele (y compris ceux sans "
+                              "service ou a plusieurs services), en regenerant l'arborescence "
+                              "sous --output-root.")
+    parser.add_argument("--file", default=None,
+                         help="Exporte un fichier .proto precis, designe par son chemin "
+                              "d'origine (SourceFile), ex: soba_function_api/types.proto -- "
+                              "utile pour un fichier sans service.")
     parser.add_argument("--layer", default=None, choices=list(LAYER_CHOICES),
-                         help="Restreint la recherche a une couche si le nom est ambigu "
-                              "(mode simple), ou limite --all a cette couche.")
+                         help="Restreint la recherche a une couche.")
+    parser.add_argument("--include-legacy", action="store_true",
+                         help="Avec --all : exporte AUSSI les Interfaces sans SourceFile, dans "
+                              "l'ancien mode par Interface (modeles importes avant ce "
+                              "mecanisme). Par defaut non : sinon TOUTES les Interfaces du "
+                              "modele, y compris celles sans rapport avec gRPC, seraient "
+                              "exportees.")
     parser.add_argument("--order", default="messages-first",
                          choices=["messages-first", "service-first"],
-                         help="Ordre de generation : messages-first (defaut, convention gRPC "
-                              "officielle -- types detailles d'abord) ou service-first "
-                              "(le service en tete du fichier).")
+                         help="messages-first (defaut : enums, messages, puis services) ou "
+                              "service-first.")
     parser.add_argument("--package", default=None,
-                         help="Force le package proto (prioritaire sur le PVMT de "
-                              "l'Interface s'il existe). Sans cet argument, tente de "
-                              "lire Grpc.Metadata.Package via PVMT ; sinon omis. En mode "
-                              "--all, applique a TOUTES les Interfaces si donne -- "
-                              "generalement a laisser vide pour que chacune garde son "
-                              "propre package via PVMT.")
+                         help="Force le package proto (prioritaire sur le PVMT). En mode --all, "
+                              "a laisser vide pour que chaque fichier garde le sien.")
     args = parser.parse_args()
 
-    if args.all:
-        if args.interface_name or args.output_path or not args.output_root:
-            print("ERREUR : --all s'utilise avec --output-root uniquement, sans nom "
-                  "d'Interface ni chemin de sortie explicite.")
-            sys.exit(1)
-    elif bool(args.output_path) == bool(args.output_root):
-        print("ERREUR : donnez soit un chemin de sortie explicite, soit --output-root "
-              "(pas les deux, pas aucun des deux). Ou --all pour tout exporter.")
+    modes = sum(bool(x) for x in (args.all, args.file, args.interface_name))
+    if modes != 1:
+        print("ERREUR : choisissez UN mode : un nom d'Interface, --file ou --all.")
         sys.exit(1)
-    elif not args.interface_name:
-        print("ERREUR : donnez le nom de l'Interface a exporter (ou --all pour tout exporter).")
+    if args.all and (args.output_path or not args.output_root):
+        print("ERREUR : --all s'utilise avec --output-root uniquement.")
+        sys.exit(1)
+    if not args.all and bool(args.output_path) == bool(args.output_root):
+        print("ERREUR : donnez soit un chemin de sortie explicite, soit --output-root.")
         sys.exit(1)
 
     model = capellambse.MelodyModel(args.model_path)
+    files = collect_files(model, args.layer)
 
     if args.all:
-        interfaces = list(model.search("Interface"))
-        if args.layer:
-            target_uuid = getattr(model, args.layer).uuid
-            interfaces = [i for i in interfaces if i.layer.uuid == target_uuid]
-        if not interfaces:
-            print("ERREUR : aucune Interface trouvee" +
-                  (f" dans {LAYER_CHOICES[args.layer]}." if args.layer else " dans le modele."))
+        # Interfaces sans SourceFile (importees avant ce mecanisme, ou PVMT
+        # absent) : repli sur l'ancien export par Interface.
+        layer_uuid = getattr(model, args.layer).uuid if args.layer else None
+        orphans = [i for i in model.search("Interface")
+                   if _in_layer(i, layer_uuid) and not get_type_source_file(i)]
+        if orphans and not args.include_legacy:
+            print(f"INFO : {len(orphans)} Interface(s) sans SourceFile ignoree(s) (non issues "
+                  f"d'un import .proto, ou importees avant ce mecanisme) -- ajoutez "
+                  f"--include-legacy pour les exporter dans l'ancien mode.")
+            orphans = []
+        if not files and not orphans:
+            print("ERREUR : rien a exporter.")
             sys.exit(1)
-        print(f"INFO : {len(interfaces)} Interface(s) a exporter sous '{args.output_root}' :")
-        for i in interfaces:
-            print(f"    {i.name} ({i.layer.name})")
-
+        print(f"INFO : {len(files)} fichier(s) .proto a regenerer (SourceFile)"
+              + (f" + {len(orphans)} Interface(s) sans SourceFile (ancien mode)" if orphans else "")
+              + f" sous '{args.output_root}' :")
         exported, failed = 0, []
-        for interface in interfaces:
+        for src in sorted(files):
+            c = files[src]
             try:
-                output_path = compute_output_path(interface, args.output_root)
-                os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-                text = export_interface_to_proto(interface, order=args.order, package=args.package)
-                with open(output_path, "w") as f:
-                    f.write(text)
-                print(f"  OK  {interface.name} -> {output_path}")
+                out = os.path.join(args.output_root, src)
+                _write(out, export_file_to_proto(src, c, order=args.order, package=args.package))
+                print(f"  OK  {src}  ({len(c['enums'])} enum(s), {len(c['classes'])} message(s), "
+                      f"{len(c['interfaces'])} service(s))")
                 exported += 1
             except Exception as e:
-                print(f"  ECHEC  {interface.name} : {e}")
-                failed.append(interface.name)
-
-        print(f"\nExport termine : {exported}/{len(interfaces)} Interface(s) exportee(s)"
+                print(f"  ECHEC  {src} : {e}")
+                failed.append(src)
+        for iface in orphans:
+            try:
+                out = compute_output_path(iface, args.output_root)
+                _write(out, export_interface_to_proto(iface, order=args.order, package=args.package))
+                print(f"  OK  {iface.name} -> {out}  (sans SourceFile)")
+                exported += 1
+            except Exception as e:
+                print(f"  ECHEC  {iface.name} : {e}")
+                failed.append(iface.name)
+        total = len(files) + len(orphans)
+        print(f"\nExport termine : {exported}/{total} exporte(s)"
               + (f", {len(failed)} en echec : {', '.join(failed)}" if failed else "."))
         sys.exit(1 if failed else 0)
 
+    if args.file:
+        src = args.file.replace("\\", "/")
+        if src not in files:
+            print(f"ERREUR : aucun element avec SourceFile '{src}'. Fichiers connus :")
+            for k in sorted(files):
+                print(f"    {k}")
+            sys.exit(1)
+        out = args.output_path or os.path.join(args.output_root, src)
+        _write(out, export_file_to_proto(src, files[src], order=args.order, package=args.package))
+        print(f"Export termine : {out}")
+        sys.exit(0)
+
     interface = find_interface(model, args.interface_name, args.layer)
-
-    output_path = args.output_path or compute_output_path(interface, args.output_root)
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
-    text = export_interface_to_proto(interface, order=args.order, package=args.package)
-    with open(output_path, "w") as f:
-        f.write(text)
-
-    print(f"Export termine ({interface.layer.name}) : {output_path}")
+    src = get_type_source_file(interface)
+    if src and src in files:
+        out = args.output_path or os.path.join(args.output_root, src)
+        _write(out, export_file_to_proto(src, files[src], order=args.order, package=args.package))
+        print(f"Export termine ({interface.layer.name}) : fichier complet '{src}' -> {out}")
+    else:
+        out = args.output_path or compute_output_path(interface, args.output_root)
+        _write(out, export_interface_to_proto(interface, order=args.order, package=args.package))
+        print(f"Export termine ({interface.layer.name}) : {out}  (sans SourceFile, ancien mode)")

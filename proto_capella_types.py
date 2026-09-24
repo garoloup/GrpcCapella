@@ -123,3 +123,42 @@ PVMT_HEADER_KEY = "Grpc.Metadata.FileHeader"
 # EnumerationLiteral/Interface/Service. Meme groupe Metadata. Absent,
 # l'export utilise "//" partout (comportement anterieur).
 PVMT_COMMENT_STYLE_KEY = "Grpc.Metadata.CommentStyle"
+
+# PVMT optionnel (String) : nom du groupe 'oneof' auquel appartient un
+# champ (Property), ex: "choice". Meme groupe Metadata. Absent, les
+# champs d'un oneof sont exportes comme des champs simples (proto
+# valide, mais l'exclusivite mutuelle est perdue) -- avertissement.
+PVMT_ONEOF_KEY = "Grpc.Metadata.Oneof"
+
+
+# ----------------------------------------------------------------------
+# Lecture PVMT SANS effet de bord
+# ----------------------------------------------------------------------
+# element.pvmt["Dom.Group.Prop"] de capellambse APPLIQUE le groupe a
+# l'element (groupdef.apply) avant de lire : une simple lecture modifie
+# le modele, et leve ScopeError (qui n'est PAS une KeyError) si l'element
+# est hors du scope du groupe (ex: une Class de l'Operational Analysis
+# alors que Metadata ne couvre que Logical/Physical). On lit donc
+# directement le groupe DEJA applique ("Dom.Group"), s'il existe.
+
+def pvmt_get(element, key):
+    """Valeur d'une propriete PVMT 'Dom.Group.Prop', ou None si le groupe
+    n'est pas applique a l'element, si la propriete n'existe pas, ou si
+    l'element ne peut pas porter de PVMT. Ne modifie jamais le modele."""
+    domain, group, prop = key.split(".")
+    groups = getattr(element, "property_value_groups", None)
+    if groups is None:
+        return None
+    try:
+        applied = groups.by_name(f"{domain}.{group}", single=True)
+        return applied.property_values[prop]
+    except (KeyError, IndexError):
+        return None
+
+
+# Erreurs possibles a l'ECRITURE PVMT : KeyError (domaine/groupe absent)
+# et ScopeError (element hors du scope du groupe), sous-classe de
+# InvalidModificationError -- a traiter de la meme facon (propriete non
+# stockee, signalee en synthese), jamais comme un plantage.
+from capellambse.extensions.pvmt._config import ScopeError as _ScopeError
+PVMT_WRITE_ERRORS = (KeyError, _ScopeError.__mro__[1])

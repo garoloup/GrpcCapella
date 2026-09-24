@@ -38,9 +38,12 @@ import capellambse
 from grpc_tools import protoc
 from google.protobuf import descriptor_pb2
 import tempfile
+import posixpath
 import os
 
 from proto_capella_types import (
+    pvmt_get,
+    PVMT_WRITE_ERRORS,
     PROTO_TO_CAPELLA_PRIMITIVE,
     PVMT_STREAMING_MODE_KEY,
     PVMT_STREAMING_DOMAIN,
@@ -52,6 +55,7 @@ from proto_capella_types import (
     PVMT_SOURCE_FILE_KEY,
     PVMT_HEADER_KEY,
     PVMT_COMMENT_STYLE_KEY,
+    PVMT_ONEOF_KEY,
 )
 from setup_primitive_types import ensure_primitive_types
 
@@ -100,7 +104,9 @@ def _build_comment_index(file_proto, source_lines):
     texts, styles = {}, {}
     for loc in file_proto.source_code_info.location:
         path = tuple(loc.path)
-        if not path or path[0] not in (4, 5, 6) or len(path) not in (2, 4):
+        # longueur paire = un element (message, champ, enum, valeur, service,
+        # rpc), y compris imbrique : (4,i,3,k) message imbrique, (4,i,3,k,2,j) son champ.
+        if not path or path[0] not in (4, 5, 6) or len(path) % 2:
             continue
         if source_lines is not None and loc.span:
             start = loc.span[0]
@@ -141,19 +147,79 @@ def _extract_header_comment(file_proto, source_lines):
     return proto_comments.extract_header(source_lines, syntax_line)
 
 
-def _read_source_lines(proto_name, include_dirs):
-    """Retrouve et lit le fichier source d'un file_proto (nom relatif a
-    un repertoire -I), dans l'ordre de recherche de protoc. None si
-    introuvable ou illisible (-> repli sur le texte de protoc)."""
+def _resolve_source_path(proto_name, include_dirs):
+    """Chemin reel sur disque d'un file_proto (nom relatif a un -I), dans
+    l'ordre de recherche de protoc. None si introuvable."""
     for d in include_dirs:
         candidate = os.path.join(d, proto_name)
         if os.path.isfile(candidate):
-            try:
-                with open(candidate, encoding="utf-8", errors="replace") as f:
-                    return f.read().splitlines()
-            except OSError:
-                return None
+            return os.path.abspath(candidate)
     return None
+
+
+def _read_source_lines(real_path):
+    """Lignes du fichier source, ou None si illisible (-> repli sur le
+    texte de protoc)."""
+    if not real_path:
+        return None
+    try:
+        with open(real_path, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    except OSError:
+        return None
+
+
+def _relative_source_path(file_proto_name, real_path, base_dir):
+    """Chemin du fichier RELATIF A LA RACINE PROTO, en '/' -- determine
+    le package Capella (dossier) et le SourceFile.
+    Pourquoi pas file_proto.name : un import ecrit sans dossier entre
+    fichiers voisins (import "serviceA.proto";) est resolu par protoc via
+    le -I du dossier courant, et nomme 'serviceA.proto' (dossier vide).
+    Le meme fichier importe directement s'appelle, lui,
+    'soba_function_api/serviceA.proto' : sans correction, ses types
+    seraient crees en double (racine + sous-package). On part donc du
+    chemin REEL sur disque. Repli sur file_proto.name hors de la racine
+    (ex: well-known types Google, dans le dossier de grpcio-tools)."""
+    if real_path:
+        rel = os.path.relpath(real_path, base_dir)
+        if not rel.startswith(".."):
+            return rel.replace(os.sep, "/")
+    return file_proto_name
+
+
+def _parse_message(msg, path, qual_prefix, comments, style, nested_enums):
+    """Message -> dict, RECURSIF pour les messages imbriques (dont les
+    entrees de map, que protoc represente comme un message imbrique
+    'NomEntry' avec l'option map_entry). Chemins SourceCodeInfo :
+    champ = path+(2,j), message imbrique = path+(3,k)."""
+    qual = f"{qual_prefix}.{msg.name}"
+    oneof_names = [o.name for o in msg.oneof_decl]
+    fields = []
+    for j, f in enumerate(msg.field):
+        # proto3 'optional' : protoc cree un oneof SYNTHETIQUE '_nom' --
+        # ce n'est pas un vrai oneof, on le traduit en 'optional'.
+        is_optional = bool(f.proto3_optional)
+        oneof = None
+        if f.HasField("oneof_index") and not is_optional:
+            oneof = oneof_names[f.oneof_index]
+        fields.append({
+            "name": f.name, "number": f.number, "type": _field_type_ref(f),
+            "repeated": f.label == descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+            "optional": is_optional,
+            "oneof": oneof,
+            "comment": comments.get(path + (2, j), ""), "comment_style": style(path + (2, j)),
+        })
+    for k in range(len(msg.enum_type)):
+        nested_enums.append(f"{qual}.{msg.enum_type[k].name}")
+    return {
+        "name": msg.name,
+        "qualified_name": qual,
+        "map_entry": bool(msg.options.map_entry),
+        "fields": fields,
+        "nested": [_parse_message(n, path + (3, k), qual, comments, style, nested_enums)
+                   for k, n in enumerate(msg.nested_type)],
+        "comment": comments.get(path, ""), "comment_style": style(path),
+    }
 
 
 import grpc_tools
@@ -181,6 +247,7 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
     (dependances avant leurs dependants).
     """
     proto_path = os.path.abspath(proto_path)
+    base_dir = os.path.abspath(proto_root) if proto_root else os.path.dirname(proto_path)
     well_known_types_dir = os.path.join(os.path.dirname(grpc_tools.__file__), "_proto")
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -204,26 +271,17 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
 
     files = []
     for file_proto in fds.file:
-        source_lines = _read_source_lines(file_proto.name, include_dirs)
+        real_path = _resolve_source_path(file_proto.name, include_dirs)
+        source_lines = _read_source_lines(real_path)
         comments, comment_styles = _build_comment_index(file_proto, source_lines)
         style = lambda path: comment_styles.get(path, proto_comments.DEFAULT_STYLE)
-        folder = os.path.dirname(file_proto.name)  # ex: "service_base_api", "google/protobuf", ou "" (racine)
+        rel_path = _relative_source_path(file_proto.name, real_path, base_dir)
+        folder = posixpath.dirname(rel_path)  # ex: "service_base_api", "google/protobuf", ou "" (racine)
+        qual_prefix = f".{file_proto.package}" if file_proto.package else ""
+        nested_enums = []
 
-        messages = []
-        for i, msg in enumerate(file_proto.message_type):
-            fields = []
-            for j, f in enumerate(msg.field):
-                fields.append({
-                    "name": f.name, "number": f.number, "type": _field_type_ref(f),
-                    "repeated": f.label == descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
-                    "comment": comments.get((4, i, 2, j), ""), "comment_style": style((4, i, 2, j)),
-                })
-            messages.append({
-                "name": msg.name,
-                "qualified_name": f".{file_proto.package}.{msg.name}" if file_proto.package else f".{msg.name}",
-                "fields": fields,
-                "comment": comments.get((4, i), ""), "comment_style": style((4, i)),
-            })
+        messages = [_parse_message(msg, (4, i), qual_prefix, comments, style, nested_enums)
+                    for i, msg in enumerate(file_proto.message_type)]
 
         # Enums de premier niveau seulement (pas les enums imbriques
         # dans un message -- limite connue, cf. README).
@@ -260,8 +318,9 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
             })
 
         files.append({
-            "path": file_proto.name,
+            "path": rel_path,
             "folder": folder,
+            "nested_enums": nested_enums,
             "package": file_proto.package or None,
             "header": _extract_header_comment(file_proto, source_lines),
             "messages": messages,
@@ -323,14 +382,24 @@ def _set_literal_numeric(element, attr_name, value):
     raw_list.create("LiteralNumericValue", value=str(value))
 
 
-def set_repeated_cardinality(prop):
-    """Marque une Property comme 'repeated' (proto) : cardinalite 0..*.
-    N'est appele QUE pour les champs repeated=True ; un champ simple
-    n'est pas touche (cardinalite implicite par defaut, non-repeated
-    cote export -- cf. is_repeated() dans le script d'export, qui
-    considere max_card absent comme non-repeated)."""
-    _set_literal_numeric(prop, "min_card", 0)
-    _set_literal_numeric(prop, "max_card", "*")
+def set_field_cardinality(prop, field):
+    """Cardinalite d'une Property selon le champ proto :
+      repeated (dont map)  -> 0..*
+      optional (proto3)    -> 0..1
+      champ simple         -> 1..1, UNIQUEMENT s'il portait deja une
+                              cardinalite (ex: champ devenu simple entre
+                              deux versions du .proto) -- sinon on ne cree
+                              rien (cardinalite implicite, modele allege).
+    L'export relit ces valeurs : max '*' -> repeated, 0..1 -> optional."""
+    if field["repeated"]:
+        _set_literal_numeric(prop, "min_card", 0)
+        _set_literal_numeric(prop, "max_card", "*")
+    elif field["optional"]:
+        _set_literal_numeric(prop, "min_card", 0)
+        _set_literal_numeric(prop, "max_card", 1)
+    elif prop.min_card is not None or prop.max_card is not None:
+        _set_literal_numeric(prop, "min_card", 1)
+        _set_literal_numeric(prop, "max_card", 1)
 
 
 def get_streaming_mode_literal(model, mode_name):
@@ -408,6 +477,8 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
     header_pvmt_missing = False
     comment_style_stored = False
     comment_style_pvmt_missing = False
+    oneof_stored = False
+    oneof_pvmt_missing = False
 
     def set_source_file(element, path):
         """Pose PVMT_SOURCE_FILE_KEY sur un element (Class/Enumeration/
@@ -417,7 +488,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
         try:
             element.pvmt[PVMT_SOURCE_FILE_KEY] = path
             source_file_stored = True
-        except KeyError:
+        except PVMT_WRITE_ERRORS:
             source_file_pvmt_missing = True
 
     def set_comment_style(element, style):
@@ -427,8 +498,39 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
         try:
             element.pvmt[PVMT_COMMENT_STYLE_KEY] = style
             comment_style_stored = True
-        except KeyError:
+        except PVMT_WRITE_ERRORS:
             comment_style_pvmt_missing = True
+
+    def set_oneof(prop, oneof):
+        """Pose PVMT_ONEOF_KEY sur un champ de oneof ; efface une valeur
+        perimee si le champ n'est plus dans un oneof."""
+        nonlocal oneof_stored, oneof_pvmt_missing
+        if oneof:
+            try:
+                prop.pvmt[PVMT_ONEOF_KEY] = oneof
+                oneof_stored = True
+            except PVMT_WRITE_ERRORS:
+                oneof_pvmt_missing = True
+        else:
+            # lecture SANS effet de bord : n'applique pas le groupe aux
+            # champs qui n'en ont jamais eu besoin
+            if pvmt_get(prop, PVMT_ONEOF_KEY):
+                try:
+                    prop.pvmt[PVMT_ONEOF_KEY] = ""
+                except PVMT_WRITE_ERRORS:
+                    pass
+
+    def set_package(element, package):
+        """PVMT Package aussi sur Class/Enumeration : l'export en a besoin
+        pour qualifier un type d'un AUTRE package proto (pkg.Type)."""
+        nonlocal package_stored, package_pvmt_missing
+        if not package:
+            return
+        try:
+            element.pvmt[PVMT_PACKAGE_KEY] = package
+            package_stored = True
+        except PVMT_WRITE_ERRORS:
+            package_pvmt_missing = True
 
     def set_header(element, header):
         """Pose PVMT_HEADER_KEY (cartouche licence/copyright), optionnel,
@@ -439,7 +541,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
         try:
             element.pvmt[PVMT_HEADER_KEY] = header
             header_stored = True
-        except KeyError:
+        except PVMT_WRITE_ERRORS:
             header_pvmt_missing = True
 
     # --- Controle informatif : le chemin de DOSSIER (qui determine le
@@ -475,6 +577,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 set_comment_style(capella_enum, en["comment_style"])
             set_source_file(capella_enum, file_info["path"])
             set_header(capella_enum, file_info["header"])
+            set_package(capella_enum, file_info["package"])
             for value in en["values"]:
                 lit, _ = _get_or_create(capella_enum.owned_literals, value["name"])
                 if value["comment"]:
@@ -488,15 +591,27 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
     #     circulaires entre fichiers) -----------------------------------
     for file_info in proto_model["files"]:
         target_data_pkg = get_or_create_package_path(data_pkg, file_info["folder"], data_pkg_cache)
-        for msg in file_info["messages"]:
-            capella_class, is_new = _get_or_create(target_data_pkg.classes, msg["name"])
-            stats["created" if is_new else "updated"] += 1
-            if msg["comment"]:
-                capella_class.description = msg["comment"]
-                set_comment_style(capella_class, msg["comment_style"])
-            set_source_file(capella_class, file_info["path"])
-            set_header(capella_class, file_info["header"])
-            created_types[msg["qualified_name"]] = capella_class
+        def create_classes(messages, container):
+            """container : .classes du package (niveau fichier) ou
+            .nested_classes de la Class englobante (message imbrique,
+            dont les entrees de map 'NomEntry')."""
+            for msg in messages:
+                capella_class, is_new = _get_or_create(container, msg["name"])
+                stats["created" if is_new else "updated"] += 1
+                if msg["comment"]:
+                    capella_class.description = msg["comment"]
+                    set_comment_style(capella_class, msg["comment_style"])
+                set_source_file(capella_class, file_info["path"])
+                set_header(capella_class, file_info["header"])
+                set_package(capella_class, file_info["package"])
+                created_types[msg["qualified_name"]] = capella_class
+                create_classes(msg["nested"], capella_class.nested_classes)
+
+        create_classes(file_info["messages"], target_data_pkg.classes)
+        for qn in file_info["nested_enums"]:
+            print(f"ATTENTION : enum imbrique '{qn}' ({file_info['path']}) non gere "
+                  f"(Capella ne permet pas une Enumeration dans une Class) -- les "
+                  f"champs de ce type resteront sans type.")
 
     # --- Passe 3 : les champs de chaque Classe, maintenant que le
     #     registre global created_types est complet -----------------
@@ -508,26 +623,30 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
     for file_info in proto_model["files"]:
         target_data_pkg = get_or_create_package_path(data_pkg, file_info["folder"], data_pkg_cache)
 
-        for msg in file_info["messages"]:
-            capella_class = created_types[msg["qualified_name"]]
-            proto_field_names = {f["name"] for f in msg["fields"]}
+        def create_fields(messages):
+            for msg in messages:
+                capella_class = created_types[msg["qualified_name"]]
+                proto_field_names = {f["name"] for f in msg["fields"]}
 
-            for field in msg["fields"]:
-                prop, _ = _get_or_create(capella_class.owned_properties, field["name"])
-                if field["comment"]:
-                    prop.description = field["comment"]
-                    set_comment_style(prop, field["comment_style"])
-                field_type = resolve_type(field["type"], data_pkg, created_types)
-                if field_type is not None:
-                    prop.type = field_type
-                if field["repeated"]:
-                    set_repeated_cardinality(prop)
+                for field in msg["fields"]:
+                    prop, _ = _get_or_create(capella_class.owned_properties, field["name"])
+                    if field["comment"]:
+                        prop.description = field["comment"]
+                        set_comment_style(prop, field["comment_style"])
+                    field_type = resolve_type(field["type"], data_pkg, created_types)
+                    if field_type is not None:
+                        prop.type = field_type
+                    set_field_cardinality(prop, field)
+                    set_oneof(prop, field["oneof"])
 
-            orphan_fields = [p.name for p in capella_class.owned_properties
-                              if p.name not in proto_field_names]
-            if orphan_fields:
-                print(f"INFO : Class '{msg['name']}' ({file_info['path']}) contient des "
-                      f"champs absents de ce .proto (non supprimes) : {', '.join(orphan_fields)}")
+                orphan_fields = [p.name for p in capella_class.owned_properties
+                                  if p.name not in proto_field_names]
+                if orphan_fields:
+                    print(f"INFO : Class '{msg['name']}' ({file_info['path']}) contient des "
+                          f"champs absents de ce .proto (non supprimes) : {', '.join(orphan_fields)}")
+                create_fields(msg["nested"])
+
+        create_fields(file_info["messages"])
 
         if file_info["messages"]:
             pkg_obj, names = known_message_names_by_pkg.get(target_data_pkg.uuid, (target_data_pkg, set()))
@@ -561,7 +680,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 try:
                     capella_interface.pvmt[PVMT_PACKAGE_KEY] = file_info["package"]
                     package_stored = True
-                except KeyError:
+                except PVMT_WRITE_ERRORS:
                     package_pvmt_missing = True
 
             proto_method_names = {m["name"] for m in svc["methods"]}
@@ -593,7 +712,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 try:
                     literal = get_streaming_mode_literal(model, mode_name)
                     operation.pvmt[PVMT_STREAMING_MODE_KEY] = literal
-                except KeyError:
+                except PVMT_WRITE_ERRORS:
                     print("ATTENTION : domaine/groupe/enumeration PVMT '%s' introuvable "
                           "(ou litteral '%s' absent), streaming non renseigne pour '%s'." %
                           (PVMT_STREAMING_MODE_KEY, mode_name, method["name"]))
@@ -604,6 +723,13 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 print(f"INFO : Interface '{svc['name']}' contient des operations absentes "
                       f"de ce .proto (non supprimees) : {', '.join(orphan_methods)}")
 
+    if oneof_stored:
+        print(f"INFO : appartenance aux oneof stockee via PVMT ({PVMT_ONEOF_KEY}).")
+    if oneof_pvmt_missing:
+        domain_name, group_name = PVMT_ONEOF_KEY.split(".")[0:2]
+        print(f"ATTENTION : des champs appartiennent a un 'oneof' mais le groupe PVMT "
+              f"'{domain_name}.{group_name}' n'a pas de propriete 'Oneof' : ces champs "
+              f"seront exportes comme des champs simples (exclusivite perdue).")
     if comment_style_stored:
         print(f"INFO : style(s) de commentaire stocke(s) via PVMT ({PVMT_COMMENT_STYLE_KEY}).")
     if comment_style_pvmt_missing:
