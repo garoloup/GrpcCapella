@@ -53,6 +53,7 @@ import os
 import argparse
 import html
 import capellambse
+import proto_comments
 
 from proto_capella_types import (
     CAPELLA_TO_PROTO_PRIMITIVE,
@@ -61,6 +62,7 @@ from proto_capella_types import (
     PVMT_PACKAGE_KEY,
     PVMT_SOURCE_FILE_KEY,
     PVMT_HEADER_KEY,
+    PVMT_COMMENT_STYLE_KEY,
 )
 
 LAYER_CHOICES = {"oa": "Operational Analysis", "sa": "System Analysis",
@@ -124,22 +126,30 @@ def is_repeated(prop):
     return prop.max_card is not None and prop.max_card.value not in ("0", "1")
 
 
-def _as_comment_lines(description, indent=""):
-    """Convertit une description Capella (texte, eventuellement multi-
-    lignes/multi-paragraphes) en lignes de commentaire .proto."""
-    text = str(description).strip()
-    if not text:
-        return []
-    text = html.unescape(text)
-    lines = []
-    for raw_line in text.splitlines():
-        raw_line = raw_line.strip()
-        lines.append(f"{indent}// {raw_line}" if raw_line else f"{indent}//")
-    return lines
+def get_comment_style(element):
+    """Style de commentaire d'origine (PVMT CommentStyle, cf.
+    proto_comments.py), "//" par defaut si absent/non configure."""
+    try:
+        style = element.pvmt[PVMT_COMMENT_STYLE_KEY]
+    except KeyError:
+        return proto_comments.DEFAULT_STYLE
+    return style if style in proto_comments.KNOWN_STYLES else proto_comments.DEFAULT_STYLE
+
+
+def _description_text(element):
+    text = str(element.description).strip() if element is not None else ""
+    return html.unescape(text) if text else ""
+
+
+def _as_comment_lines(element, indent=""):
+    """Commentaire place AU-DESSUS d'un element (message, enum, service,
+    rpc), dans son style d'origine."""
+    return proto_comments.render_leading(_description_text(element),
+                                         get_comment_style(element), indent)
 
 
 def _emit_aligned_block(entries):
-    """entries : liste de (code_line_deja_indentee, description_capella,
+    """entries : liste de (code_line_deja_indentee, element_capella,
     extra_leading) -- extra_leading est une liste optionnelle de lignes
     de commentaire toujours affichees en bloc au-dessus (ex : un
     avertissement "type non resolu"), independamment de la description.
@@ -147,47 +157,39 @@ def _emit_aligned_block(entries):
     counter.proto) : un commentaire tenant sur UNE ligne est mis en fin
     de ligne de code, aligne en colonne avec les autres lignes du meme
     bloc (message/enum) ; un commentaire MULTI-lignes reste en bloc
-    au-dessus, comme avant (un commentaire multi-lignes ne peut pas
-    raisonnablement tenir en fin de ligne)."""
+    au-dessus. Dans les deux cas, le style d'origine (//, ///, /* */...)
+    est respecte (cf. proto_comments)."""
     processed = []
-    for code_line, description, extra_leading in entries:
-        text = str(description).strip()
-        text = html.unescape(text) if text else ""
+    for code_line, element, extra_leading in entries:
+        text = _description_text(element)
+        style = get_comment_style(element) if element is not None else proto_comments.DEFAULT_STYLE
+        indent = code_line[:len(code_line) - len(code_line.lstrip())]
         leading = list(extra_leading or [])
         if not text:
             processed.append((code_line, None, leading))
-        elif "\n" not in text:
-            if leading:
-                # une extra_leading force le mode "bloc au-dessus" meme
-                # pour un commentaire d'une ligne, pour rester groupe
-                # avec l'avertissement juste au-dessus.
-                indent = code_line[:len(code_line) - len(code_line.lstrip())]
-                leading.append(f"{indent}// {text}")
-                processed.append((code_line, None, leading))
-            else:
-                processed.append((code_line, text, leading))
+        elif "\n" not in text and not leading:
+            processed.append((code_line, proto_comments.render_trailing(text, style), leading))
         else:
-            indent = code_line[:len(code_line) - len(code_line.lstrip())]
-            leading.extend(f"{indent}// {l.strip()}" if l.strip() else f"{indent}//"
-                            for l in text.splitlines())
+            # multi-lignes, ou groupe avec un avertissement : bloc au-dessus
+            leading.extend(proto_comments.render_leading(text, style, indent))
             processed.append((code_line, None, leading))
 
     trailing_lens = [len(code) for code, trailing, _ in processed if trailing is not None]
-    align_col = max(trailing_lens) + 3 if trailing_lens else 0  # +3 : au moins 2 espaces avant "//"
+    align_col = max(trailing_lens) + 3 if trailing_lens else 0  # +3 : au moins 2 espaces avant le commentaire
 
     lines = []
     for code_line, trailing, leading in processed:
         lines.extend(leading)
         if trailing is not None:
             pad = " " * (align_col - len(code_line))
-            lines.append(f"{code_line}{pad}// {trailing}")
+            lines.append(f"{code_line}{pad}{trailing}")
         else:
             lines.append(code_line)
     return lines
 
 
 def class_to_proto_message(cls, needed_imports):
-    lines = _as_comment_lines(cls.description)
+    lines = _as_comment_lines(cls)
     lines.append(f"message {cls.name} {{")
     entries = []
     for counter, prop in enumerate(cls.owned_properties, start=1):
@@ -198,7 +200,7 @@ def class_to_proto_message(cls, needed_imports):
             extra_leading = ["    // ATTENTION : type non resolu pour ce champ -- verifiez le modele"]
             type_name = "bytes"  # place-holder syntaxiquement valide, signale ci-dessus
         code_line = f"    {multiplicity}{type_name} {prop.name} = {counter};"
-        entries.append((code_line, prop.description, extra_leading))
+        entries.append((code_line, prop, extra_leading))
     lines.extend(_emit_aligned_block(entries))
     lines.append("}")
     return "\n".join(lines)
@@ -208,9 +210,9 @@ def enum_to_proto(enum):
     """Regenere sequentiellement 0..N-1 (cf. limite documentee en tete
     de fichier : Capella ne stocke pas la valeur numerique proto).
     Commentaires courts alignes en fin de ligne (cf. _emit_aligned_block)."""
-    lines = _as_comment_lines(enum.description)
+    lines = _as_comment_lines(enum)
     lines.append(f"enum {enum.name} {{")
-    entries = [(f"    {lit.name} = {number};", lit.description, None)
+    entries = [(f"    {lit.name} = {number};", lit, None)
                for number, lit in enumerate(enum.owned_literals)]
     lines.extend(_emit_aligned_block(entries))
     lines.append("}")
@@ -221,7 +223,7 @@ def interface_to_proto_service(interface, needed_imports):
     """needed_imports : set mutable, alimente si un well-known type
     Google est rencontre (pour que l'appelant sache quels 'import'
     ecrire)."""
-    lines = _as_comment_lines(interface.description)
+    lines = _as_comment_lines(interface)
     lines.append(f"service {interface.name} {{")
     first_method = True
     for op in interface.owned_features:
@@ -254,7 +256,7 @@ def interface_to_proto_service(interface, needed_imports):
 
         in_stream = "stream " if client_streaming else ""
         out_stream = "stream " if server_streaming else ""
-        lines.extend(_as_comment_lines(op.description, indent="    "))
+        lines.extend(_as_comment_lines(op, indent="    "))
         lines.append(
             f"    rpc {op.name}({in_stream}{in_type}) returns ({out_stream}{out_type});"
         )
@@ -409,11 +411,10 @@ def export_interface_to_proto(interface, referenced_classes=None, referenced_enu
 
     header = []
     if file_header:
-        # cartouche (licence/copyright), separe du reste par une ligne
-        # vide -- meme convention que le fichier d'origine (cf.
-        # leading_detached_comments cote import).
-        header.extend(f"// {l}" if l else "//" for l in file_header.splitlines())
-        header.append("")
+        # cartouche (licence/copyright) stocke BRUT a l'import (marqueurs,
+        # bordures et ligne vide eventuelle compris) -> restitue a
+        # l'identique ; ancien format (texte nettoye) gere aussi.
+        header.extend(proto_comments.render_header(file_header))
     header.append('syntax = "proto3";')
     for import_path in sorted(needed_imports):
         header.append(f'import "{import_path}";')

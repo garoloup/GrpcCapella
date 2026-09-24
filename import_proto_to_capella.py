@@ -51,6 +51,7 @@ from proto_capella_types import (
     PVMT_PACKAGE_KEY,
     PVMT_SOURCE_FILE_KEY,
     PVMT_HEADER_KEY,
+    PVMT_COMMENT_STYLE_KEY,
 )
 from setup_primitive_types import ensure_primitive_types
 
@@ -74,45 +75,89 @@ def _field_type_ref(field):
     return descriptor_pb2.FieldDescriptorProto.Type.Name(field.type).replace("TYPE_", "").lower()
 
 
-def _build_comment_index(file_proto):
-    """
-    Construit un dict {tuple(path): commentaire} a partir de
-    SourceCodeInfo. Encodage des chemins (cf. descriptor.proto) :
-      [4, i]       -> message_type[i]           (le message lui-meme)
-      [4, i, 2, j]  -> message_type[i].field[j]   (un champ)
-      [5, i]       -> enum_type[i]                (l'enum lui-meme)
-      [5, i, 2, j]  -> enum_type[i].value[j]       (une valeur)
-      [6, i]       -> service[i]                 (le service lui-meme)
-      [6, i, 2, j]  -> service[i].method[j]        (une methode/rpc)
-    """
-    index = {}
-    for loc in file_proto.source_code_info.location:
-        comment = (loc.leading_comments or loc.trailing_comments or "").strip()
-        if comment:
-            index[tuple(loc.path)] = comment
-    return index
+def _clean_protoc_comment(text):
+    """Repli (source brut illisible) : texte de protoc, debarrasse des
+    artefacts connus -- '/' en tete de ligne pour '///', ligne '*' seule
+    pour '/**'."""
+    lines = [l[1:] if l.startswith("/") else l for l in text.splitlines()]
+    lines = [l for l in lines if l.strip() != "*"]
+    return "\n".join(l.strip() for l in lines).strip()
 
 
-def _extract_header_comment(file_proto):
+def _build_comment_index(file_proto, source_lines):
     """
-    Le cartouche d'en-tete (licence/copyright) est rattache au champ
-    "syntax" de FileDescriptorProto (path [12]), sous deux formes
-    possibles selon qu'il y a une ligne vide avant 'syntax = ...;' :
-      - PAS de ligne vide (ex: '// Counter interface' juste au-dessus)
-        -> leading_comments normal.
-      - Ligne vide separatrice (ex: licence Apache multi-lignes)
-        -> leading_detached_comments ("detache").
-    Les deux cas verifies par test direct."""
+    Construit deux dicts {tuple(path): texte} et {tuple(path): style} :
+    protoc (SourceCodeInfo, loc.span) sert UNIQUEMENT a localiser la
+    ligne de chaque element ; le commentaire est relu dans le source
+    brut (source_lines) pour en conserver le style (cf. proto_comments).
+    Commentaire au-dessus prioritaire sur le commentaire de fin de ligne.
+    Encodage des chemins (cf. descriptor.proto) :
+      [4, i] / [4, i, 2, j]  -> message / champ
+      [5, i] / [5, i, 2, j]  -> enum / valeur
+      [6, i] / [6, i, 2, j]  -> service / methode (rpc)
+    Repli si source_lines est None : texte protoc nettoye, style "//".
+    """
+    texts, styles = {}, {}
     for loc in file_proto.source_code_info.location:
-        if list(loc.path) == [12]:
-            if loc.leading_comments:
-                return loc.leading_comments.strip()
-            if loc.leading_detached_comments:
-                return "\n\n".join(c.strip() for c in loc.leading_detached_comments).strip()
-    return ""
+        path = tuple(loc.path)
+        if not path or path[0] not in (4, 5, 6) or len(path) not in (2, 4):
+            continue
+        if source_lines is not None and loc.span:
+            start = loc.span[0]
+            end = loc.span[2] if len(loc.span) == 4 else loc.span[0]
+            text, style = proto_comments.extract_leading(source_lines, start)
+            if not text:
+                text, style = proto_comments.extract_trailing(source_lines, end)
+        else:
+            raw = (loc.leading_comments or loc.trailing_comments or "").strip()
+            text, style = _clean_protoc_comment(raw), proto_comments.DEFAULT_STYLE
+        if text:
+            texts[path] = text
+            styles[path] = style or proto_comments.DEFAULT_STYLE
+    return texts, styles
+
+
+def _extract_header_comment(file_proto, source_lines):
+    """
+    Cartouche d'en-tete : tout ce qui precede 'syntax = ...;', relu BRUT
+    dans le source (marqueurs, bordures /****/ et ligne vide finale
+    compris) pour une restitution a l'identique a l'export. La ligne de
+    'syntax' est localisee via protoc (champ syntax, path [12]).
+    Repli si le source est illisible : texte nettoye par protoc (ancien
+    comportement -- l'export le reconnait et le prefixe de '// ').
+    """
+    syntax_line = None
+    for loc in file_proto.source_code_info.location:
+        if list(loc.path) == [12] and loc.span:
+            syntax_line = loc.span[0]
+            if source_lines is None:
+                if loc.leading_comments:
+                    return loc.leading_comments.strip()
+                if loc.leading_detached_comments:
+                    return "\n\n".join(c.strip() for c in loc.leading_detached_comments).strip()
+                return ""
+    if source_lines is None:
+        return ""
+    return proto_comments.extract_header(source_lines, syntax_line)
+
+
+def _read_source_lines(proto_name, include_dirs):
+    """Retrouve et lit le fichier source d'un file_proto (nom relatif a
+    un repertoire -I), dans l'ordre de recherche de protoc. None si
+    introuvable ou illisible (-> repli sur le texte de protoc)."""
+    for d in include_dirs:
+        candidate = os.path.join(d, proto_name)
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate, encoding="utf-8", errors="replace") as f:
+                    return f.read().splitlines()
+            except OSError:
+                return None
+    return None
 
 
 import grpc_tools
+import proto_comments
 
 
 def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
@@ -140,13 +185,14 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
 
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "descriptor.pb")
-        args = ["protoc"]
+        include_dirs = []
         if proto_root:
-            args.append("-I" + os.path.abspath(proto_root))
-        args.append("-I" + os.path.dirname(proto_path))  # repli pour fichier isole
-        args.append("-I" + well_known_types_dir)
+            include_dirs.append(os.path.abspath(proto_root))
+        include_dirs.append(os.path.dirname(proto_path))  # repli pour fichier isole
+        include_dirs.append(well_known_types_dir)
         for extra_dir in (extra_include_dirs or []):
-            args.append("-I" + os.path.abspath(extra_dir))
+            include_dirs.append(os.path.abspath(extra_dir))
+        args = ["protoc"] + ["-I" + d for d in include_dirs]
         args += ["--include_imports", "--include_source_info",
                   "--descriptor_set_out=" + out_path, proto_path]
         if protoc.main(args) != 0:
@@ -158,7 +204,9 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
 
     files = []
     for file_proto in fds.file:
-        comments = _build_comment_index(file_proto)
+        source_lines = _read_source_lines(file_proto.name, include_dirs)
+        comments, comment_styles = _build_comment_index(file_proto, source_lines)
+        style = lambda path: comment_styles.get(path, proto_comments.DEFAULT_STYLE)
         folder = os.path.dirname(file_proto.name)  # ex: "service_base_api", "google/protobuf", ou "" (racine)
 
         messages = []
@@ -168,13 +216,13 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
                 fields.append({
                     "name": f.name, "number": f.number, "type": _field_type_ref(f),
                     "repeated": f.label == descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
-                    "comment": comments.get((4, i, 2, j), ""),
+                    "comment": comments.get((4, i, 2, j), ""), "comment_style": style((4, i, 2, j)),
                 })
             messages.append({
                 "name": msg.name,
                 "qualified_name": f".{file_proto.package}.{msg.name}" if file_proto.package else f".{msg.name}",
                 "fields": fields,
-                "comment": comments.get((4, i), ""),
+                "comment": comments.get((4, i), ""), "comment_style": style((4, i)),
             })
 
         # Enums de premier niveau seulement (pas les enums imbriques
@@ -185,13 +233,13 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
             for j, v in enumerate(en.value):
                 values.append({
                     "name": v.name, "number": v.number,
-                    "comment": comments.get((5, i, 2, j), ""),
+                    "comment": comments.get((5, i, 2, j), ""), "comment_style": style((5, i, 2, j)),
                 })
             enums.append({
                 "name": en.name,
                 "qualified_name": f".{file_proto.package}.{en.name}" if file_proto.package else f".{en.name}",
                 "values": values,
-                "comment": comments.get((5, i), ""),
+                "comment": comments.get((5, i), ""), "comment_style": style((5, i)),
             })
 
         services = []
@@ -204,18 +252,18 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
                     "output_type": m.output_type,  # idem
                     "client_streaming": bool(m.client_streaming),
                     "server_streaming": bool(m.server_streaming),
-                    "comment": comments.get((6, i, 2, j), ""),
+                    "comment": comments.get((6, i, 2, j), ""), "comment_style": style((6, i, 2, j)),
                 })
             services.append({
                 "name": svc.name, "methods": methods,
-                "comment": comments.get((6, i), ""),
+                "comment": comments.get((6, i), ""), "comment_style": style((6, i)),
             })
 
         files.append({
             "path": file_proto.name,
             "folder": folder,
             "package": file_proto.package or None,
-            "header": _extract_header_comment(file_proto),
+            "header": _extract_header_comment(file_proto, source_lines),
             "messages": messages,
             "enums": enums,
             "services": services,
@@ -358,6 +406,8 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
     source_file_pvmt_missing = False
     header_stored = False
     header_pvmt_missing = False
+    comment_style_stored = False
+    comment_style_pvmt_missing = False
 
     def set_source_file(element, path):
         """Pose PVMT_SOURCE_FILE_KEY sur un element (Class/Enumeration/
@@ -369,6 +419,16 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             source_file_stored = True
         except KeyError:
             source_file_pvmt_missing = True
+
+    def set_comment_style(element, style):
+        """Pose PVMT_COMMENT_STYLE_KEY (optionnel) -- appele seulement
+        quand l'element a un commentaire."""
+        nonlocal comment_style_stored, comment_style_pvmt_missing
+        try:
+            element.pvmt[PVMT_COMMENT_STYLE_KEY] = style
+            comment_style_stored = True
+        except KeyError:
+            comment_style_pvmt_missing = True
 
     def set_header(element, header):
         """Pose PVMT_HEADER_KEY (cartouche licence/copyright), optionnel,
@@ -412,12 +472,14 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             stats["created" if is_new else "updated"] += 1
             if en["comment"]:
                 capella_enum.description = en["comment"]
+                set_comment_style(capella_enum, en["comment_style"])
             set_source_file(capella_enum, file_info["path"])
             set_header(capella_enum, file_info["header"])
             for value in en["values"]:
                 lit, _ = _get_or_create(capella_enum.owned_literals, value["name"])
                 if value["comment"]:
                     lit.description = value["comment"]
+                    set_comment_style(lit, value["comment_style"])
             created_types[en["qualified_name"]] = capella_enum
 
     # --- Passe 2 : Classes (juste creees, sans les champs -- pour que
@@ -431,6 +493,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             stats["created" if is_new else "updated"] += 1
             if msg["comment"]:
                 capella_class.description = msg["comment"]
+                set_comment_style(capella_class, msg["comment_style"])
             set_source_file(capella_class, file_info["path"])
             set_header(capella_class, file_info["header"])
             created_types[msg["qualified_name"]] = capella_class
@@ -453,6 +516,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 prop, _ = _get_or_create(capella_class.owned_properties, field["name"])
                 if field["comment"]:
                     prop.description = field["comment"]
+                    set_comment_style(prop, field["comment_style"])
                 field_type = resolve_type(field["type"], data_pkg, created_types)
                 if field_type is not None:
                     prop.type = field_type
@@ -489,6 +553,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             stats["created" if is_new else "updated"] += 1
             if svc["comment"]:
                 capella_interface.description = svc["comment"]
+                set_comment_style(capella_interface, svc["comment_style"])
             set_source_file(capella_interface, file_info["path"])
             set_header(capella_interface, file_info["header"])
 
@@ -506,6 +571,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                     capella_interface.owned_features, method["name"], typehint="Service")
                 if method["comment"]:
                     operation.description = method["comment"]
+                    set_comment_style(operation, method["comment_style"])
 
                 # google.protobuf.Empty (et tout autre type, custom ou
                 # Google) est desormais un VRAI type resolu via le
@@ -538,6 +604,13 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 print(f"INFO : Interface '{svc['name']}' contient des operations absentes "
                       f"de ce .proto (non supprimees) : {', '.join(orphan_methods)}")
 
+    if comment_style_stored:
+        print(f"INFO : style(s) de commentaire stocke(s) via PVMT ({PVMT_COMMENT_STYLE_KEY}).")
+    if comment_style_pvmt_missing:
+        domain_name, group_name = PVMT_COMMENT_STYLE_KEY.split(".")[0:2]
+        print(f"INFO : style(s) de commentaire NON stocke(s) -- le groupe PVMT "
+              f"'{domain_name}.{group_name}' n'a pas de propriete 'CommentStyle' "
+              f"(optionnel) : l'export utilisera '//' partout.")
     if header_stored:
         print(f"INFO : cartouche(s) d'en-tete stocke(s) via PVMT ({PVMT_HEADER_KEY}).")
     if header_pvmt_missing:

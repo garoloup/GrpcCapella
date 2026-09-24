@@ -44,6 +44,7 @@ uv pip freeze > requirements.txt     # then: uv pip install -r requirements.txt
 | File | Role |
 |---|---|
 | `proto_capella_types.py` | Shared mapping between proto types and Capella `DataType`, plus every PVMT key (streaming, package, source file). **Adjust once** to match the real names used in your project (see §6). |
+| `proto_comments.py` | Detects and renders comment styles (`//`, `///`, `/* */`, `/** */`, boxed one-`/* */`-per-line, with or without borders), shared by import and export to keep them symmetric (§7.5). |
 | `import_proto_to_capella.py` | Imports a `.proto` file (and its transitive imports) into a Capella model. |
 | `export_capella_to_proto.py` | Exports a Capella Interface to a `.proto` file. |
 | `verify_import.py` | Re-reads a model after import and prints what was created, for a quick sanity check. |
@@ -313,11 +314,11 @@ and export: a single edit covers both directions.
 
 ## 7. PVMT setup — once per project
 
-Four optional-but-useful pieces of information go through Capella's
+Five optional-but-useful pieces of information go through Capella's
 PVMT extension: the gRPC streaming mode (§7.1, the only one of the
-four that blocks the import if missing), the original proto
-`package` (§7.2), the exact source file path (§7.3), and the file
-header block (§7.4). None of these can be created by script: neither
+five that blocks the import if missing), the original proto
+`package` (§7.2), the exact source file path (§7.3), the file header
+block (§7.4), and the comment style (§7.5). None of these can be created by script: neither
 Python4Capella nor `capellambse` support it (a deliberate limitation
 of both tools) — it's a one-time manual setup in Capella, via the
 **PV Definition Editor** (select any model element, open the
@@ -392,11 +393,43 @@ being inlined as before.
 | Group | `Metadata` (same as above) | — |
 | Property (inside Metadata) | `FileHeader` | String |
 
-If present, records the license/copyright header block at the top of
-the file (the comment block separated from `syntax = "proto3";` by a
-blank line, on `Class`/`Enumeration`/`Interface`), and regenerates it
-verbatim at the top of the exported file. If absent, no header is
-written on export, even if the original file had one.
+If present, records the license/copyright header block — everything
+before `syntax = "proto3";` — **raw**, markers included (`//`, `/* */`,
+`/****/` borders), along with the blank line that may separate it from
+`syntax`. It is regenerated character for character on export. If
+absent, no header is written on export, even if the original file had
+one.
+
+### 7.5 Comment style (optional)
+
+| Level | Name | Type |
+|---|---|---|
+| Domain | `Grpc` | — |
+| Group | `Metadata` (same as above) | — |
+| Property (inside Metadata) | `CommentStyle` | String |
+
+`protoc` does not preserve comment syntax, and even degrades the text
+(`/// text` becomes `/ text`, the first line of a boxed `/* */` comment
+is lost…). The import therefore re-reads each comment from the raw
+source file: the Capella **description** gets the clean text (no
+markers), and this property records each element's original **style**
+(`Class`, `Property`, `Enumeration`, enum value, `Interface`, `Service`):
+
+| Value | Original syntax |
+|---|---|
+| `//` | `// text` (default) |
+| `///` | `/// text` |
+| `block` | `/* text ... */`, a single block spanning the lines |
+| `javadoc` | `/**` then ` * text` then ` */` |
+| `boxed` | one `/* text */` per line, closings aligned |
+| `boxed_border` | same, with `/*****/` border lines before and after |
+
+On export, a single-line comment stays at the end of the code line
+(column-aligned), in its original style (`// `, `/// ` or `/* */`); a
+multi-line comment is restored above the element in its style. If
+absent, the export uses `//` everywhere (previous behavior). One known
+gap: inside a boxed comment, padding spaces beyond the longest line are
+not preserved (the `*/` stay aligned with each other).
 
 
 ## 8. Re-importing: update vs duplication
@@ -424,10 +457,6 @@ import (pre-existing unrelated content) — expected if your `DataPkg`
 
 ## 9. Known limitations
 
-- **`repeated`**: export determines `repeated` from the Capella
-  `Property`'s cardinality (`max_card`). Import does not set this
-  cardinality explicitly, so a `repeated` field that's imported and
-  re-exported will come back as a plain singular field.
 - **Nested enums**: only `enum`s declared at file level are handled,
   not ones nested inside a `message`.
 - **Enum numeric values**: Capella has no explicit per-literal value

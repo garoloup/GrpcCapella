@@ -116,3 +116,10 @@ PVMT_SOURCE_FILE_KEY = "Grpc.Metadata.SourceFile"
 # groupe Metadata, propriete String "FileHeader". Regenere en tete du
 # fichier exporte s'il est present.
 PVMT_HEADER_KEY = "Grpc.Metadata.FileHeader"
+
+# PVMT optionnel (String) : style de commentaire d'origine de chaque
+# element ("//", "///", "block", "javadoc", "boxed", "boxed_border" --
+# cf. proto_comments.py), pose sur Class/Property/Enumeration/
+# EnumerationLiteral/Interface/Service. Meme groupe Metadata. Absent,
+# l'export utilise "//" partout (comportement anterieur).
+PVMT_COMMENT_STYLE_KEY = "Grpc.Metadata.CommentStyle"

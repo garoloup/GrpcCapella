@@ -44,6 +44,7 @@ uv pip freeze > requirements.txt     # puis : uv pip install -r requirements.txt
 | Fichier | Rôle |
 |---|---|
 | `proto_capella_types.py` | Mapping partagé types proto ↔ DataType Capella, et toutes les clés PVMT (streaming, package, fichier d'origine). **À adapter une seule fois** aux noms réels de votre projet (voir §6). |
+| `proto_comments.py` | Détection et rendu des styles de commentaires (`//`, `///`, `/* */`, `/** */`, encadré `/* */` par ligne, avec ou sans bordures), partagé par l'import et l'export pour garantir la symétrie (§7.5). |
 | `import_proto_to_capella.py` | Importe un `.proto` (et ses imports transitifs) vers un modèle Capella. |
 | `export_capella_to_proto.py` | Exporte une Interface Capella vers un `.proto`. |
 | `verify_import.py` | Relit un modèle après import et affiche ce qui a été créé, pour vérification rapide. |
@@ -321,11 +322,11 @@ sens.
 
 ## 7. Procédure PVMT — à faire une fois par projet
 
-Quatre informations optionnelles-mais-utiles passent par l'extension
-PVMT de Capella : le mode de streaming gRPC (§7.1, la seule des quatre
+Cinq informations optionnelles-mais-utiles passent par l'extension
+PVMT de Capella : le mode de streaming gRPC (§7.1, la seule des cinq
 qui bloque l'import si absente), le `package` proto d'origine (§7.2),
-le chemin de fichier d'origine exact (§7.3), et le cartouche d'en-tête
-(§7.4). Aucune ne peut être créée par script : ni Python4Capella ni
+le chemin de fichier d'origine exact (§7.3), le cartouche d'en-tête
+(§7.4) et le style des commentaires (§7.5). Aucune ne peut être créée par script : ni Python4Capella ni
 `capellambse` ne le permettent (limite volontaire des deux outils) —
 c'est une configuration manuelle à faire une fois dans Capella, via le
 **PV Definition Editor** (sélectionnez un élément du modèle, ouvrez la
@@ -399,10 +400,44 @@ références croisées redeviennent inlinées comme avant.
 | Property (dans Metadata) | `FileHeader` | String |
 
 Si présente, mémorise le cartouche de licence/copyright en tête de
-fichier (le bloc de commentaires séparé de `syntax = "proto3";` par une
-ligne vide, sur `Class`/`Enumeration`/`Interface`), et le régénère à
-l'identique en tête du fichier exporté. Absente, aucun cartouche n'est
-écrit à l'export, même si le fichier d'origine en avait un.
+fichier — tout ce qui précède `syntax = "proto3";` — **brut**, marqueurs
+compris (`//`, `/* */`, bordures `/****/`), ainsi que la ligne vide qui
+le sépare éventuellement de `syntax`. Il est régénéré caractère par
+caractère à l'export. Absente, aucun cartouche n'est écrit à l'export,
+même si le fichier d'origine en avait un.
+
+### 7.5 Style des commentaires (optionnel)
+
+| Niveau | Nom | Type |
+|---|---|---|
+| Domain | `Grpc` | — |
+| Group | `Metadata` (le même que ci-dessus) | — |
+| Property (dans Metadata) | `CommentStyle` | String |
+
+`protoc` ne conserve pas la syntaxe des commentaires, et en dégrade même
+le texte (`/// texte` devient `/ texte`, la première ligne d'un encadré
+`/* */` est perdue…). L'import relit donc chaque commentaire dans le
+fichier source brut : la **description** Capella reçoit le texte
+nettoyé (sans marqueurs), et cette propriété mémorise le **style**
+d'origine de chaque élément (`Class`, `Property`, `Enumeration`, valeur
+d'enum, `Interface`, `Service`) :
+
+| Valeur | Syntaxe d'origine |
+|---|---|
+| `//` | `// texte` (défaut) |
+| `///` | `/// texte` |
+| `block` | `/* texte ... */`, un seul bloc englobant les lignes |
+| `javadoc` | `/**` puis ` * texte` puis ` */` |
+| `boxed` | un `/* texte */` par ligne, fermetures alignées |
+| `boxed_border` | idem, avec lignes de bordure `/*****/` avant et après |
+
+À l'export, un commentaire tenant sur une ligne reste placé en fin de
+ligne (aligné en colonne), dans son style d'origine (`// `, `/// ` ou
+`/* */`) ; un commentaire multi-lignes est restitué au-dessus de
+l'élément dans son style. Absente, l'export utilise `//` partout
+(comportement antérieur). Seul écart connu : dans un encadré, les
+espaces de remplissage au-delà de la ligne la plus longue ne sont pas
+conservés (les `*/` restent alignés entre eux).
 
 
 ## 8. Ré-import : mise à jour vs duplication
@@ -430,10 +465,6 @@ sous-package) contient d'autres éléments.
 
 ## 9. Limites connues
 
-- **`repeated`** : l'export détermine `repeated` à partir de la
-  cardinalité (`max_card`) de la `Property` Capella. L'import ne pose
-  pas cette cardinalité explicitement — un champ `repeated` importé
-  puis ré-exporté ressortira donc comme simple.
 - **Enums imbriqués** : seuls les `enum` déclarés au niveau du fichier
   sont gérés, pas ceux imbriqués dans un `message`.
 - **Valeurs numériques des enums** : Capella ne stocke pas de valeur
