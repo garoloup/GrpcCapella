@@ -257,6 +257,34 @@ def resolve_type(type_ref, root_data_pkg, created_types):
         return None
 
 
+def _set_literal_numeric(element, attr_name, value):
+    """Pose min_card/max_card (ou min_value/max_value, meme mecanisme)
+    sur un MultiplicityElement (ex: Property) -- necessite un vrai
+    objet LiteralNumericValue, pas une simple chaine/entier (verifie
+    par test direct : assigner une valeur brute leve
+    "TypeError: Cannot create object from a single attribute").
+    Idempotent : si deja pose, met a jour sa valeur plutot que d'en
+    creer un second (le wrapper Single ne garantit l'unicite qu'a la
+    LECTURE, pas a l'ecriture -- creer sans verifier dupliquerait)."""
+    current = getattr(element, attr_name)
+    if current is not None:
+        current.value = str(value)
+        return
+    descriptor = getattr(type(element), attr_name)
+    raw_list = descriptor.wrapped.__get__(element, type(element))
+    raw_list.create("LiteralNumericValue", value=str(value))
+
+
+def set_repeated_cardinality(prop):
+    """Marque une Property comme 'repeated' (proto) : cardinalite 0..*.
+    N'est appele QUE pour les champs repeated=True ; un champ simple
+    n'est pas touche (cardinalite implicite par defaut, non-repeated
+    cote export -- cf. is_repeated() dans le script d'export, qui
+    considere max_card absent comme non-repeated)."""
+    _set_literal_numeric(prop, "min_card", 0)
+    _set_literal_numeric(prop, "max_card", "*")
+
+
 def get_streaming_mode_literal(model, mode_name):
     """Recupere l'objet EnumerationPropertyLiteral pour un nom de mode
     (ex: 'BIDIR_STREAMING') -- une propriete PVMT d'enumeration exige
@@ -428,6 +456,8 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 field_type = resolve_type(field["type"], data_pkg, created_types)
                 if field_type is not None:
                     prop.type = field_type
+                if field["repeated"]:
+                    set_repeated_cardinality(prop)
 
             orphan_fields = [p.name for p in capella_class.owned_properties
                               if p.name not in proto_field_names]
