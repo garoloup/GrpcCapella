@@ -162,3 +162,12 @@ def pvmt_get(element, key):
 # stockee, signalee en synthese), jamais comme un plantage.
 from capellambse.extensions.pvmt._config import ScopeError as _ScopeError
 PVMT_WRITE_ERRORS = (KeyError, _ScopeError.__mro__[1])
+
+
+# PVMT optionnel (String) : numero d'origine d'un champ (Property) ou
+# d'une valeur d'enum (EnumerationLiteral), ex: "5". Meme groupe
+# Metadata. INDISPENSABLE a la compatibilite binaire gRPC : sans lui,
+# l'export renumerote 1, 2, 3... (ou 0, 1, 2... pour un enum), ce qui
+# change le format sur le fil des qu'il y a un trou ou un ordre
+# different dans l'original.
+PVMT_FIELD_NUMBER_KEY = "Grpc.Metadata.FieldNumber"

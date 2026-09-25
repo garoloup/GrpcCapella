@@ -56,6 +56,7 @@ from proto_capella_types import (
     PVMT_HEADER_KEY,
     PVMT_COMMENT_STYLE_KEY,
     PVMT_ONEOF_KEY,
+    PVMT_FIELD_NUMBER_KEY,
 )
 from setup_primitive_types import ensure_primitive_types
 
@@ -479,12 +480,20 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
     comment_style_pvmt_missing = False
     oneof_stored = False
     oneof_pvmt_missing = False
+    number_stored = False
+    number_pvmt_missing = False
+    redefinitions = []
 
     def set_source_file(element, path):
         """Pose PVMT_SOURCE_FILE_KEY sur un element (Class/Enumeration/
         Interface), optionnel -- met a jour les compteurs de synthese
         plutot que d'imprimer un avertissement par element."""
         nonlocal source_file_stored, source_file_pvmt_missing
+        previous = pvmt_get(element, PVMT_SOURCE_FILE_KEY)
+        if previous and previous != path:
+            # meme nom, meme package, mais defini dans un AUTRE fichier :
+            # redefinition (protoc refuserait les deux fichiers ensemble)
+            redefinitions.append((element.name, previous, path))
         try:
             element.pvmt[PVMT_SOURCE_FILE_KEY] = path
             source_file_stored = True
@@ -531,6 +540,16 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             package_stored = True
         except PVMT_WRITE_ERRORS:
             package_pvmt_missing = True
+
+    def set_field_number(element, number):
+        """Pose PVMT_FIELD_NUMBER_KEY (numero proto d'origine) sur un
+        champ ou une valeur d'enum."""
+        nonlocal number_stored, number_pvmt_missing
+        try:
+            element.pvmt[PVMT_FIELD_NUMBER_KEY] = str(number)
+            number_stored = True
+        except PVMT_WRITE_ERRORS:
+            number_pvmt_missing = True
 
     def set_header(element, header):
         """Pose PVMT_HEADER_KEY (cartouche licence/copyright), optionnel,
@@ -580,6 +599,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             set_package(capella_enum, file_info["package"])
             for value in en["values"]:
                 lit, _ = _get_or_create(capella_enum.owned_literals, value["name"])
+                set_field_number(lit, value["number"])
                 if value["comment"]:
                     lit.description = value["comment"]
                     set_comment_style(lit, value["comment_style"])
@@ -637,6 +657,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                     if field_type is not None:
                         prop.type = field_type
                     set_field_cardinality(prop, field)
+                    set_field_number(prop, field["number"])
                     set_oneof(prop, field["oneof"])
 
                 orphan_fields = [p.name for p in capella_class.owned_properties
@@ -723,6 +744,23 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 print(f"INFO : Interface '{svc['name']}' contient des operations absentes "
                       f"de ce .proto (non supprimees) : {', '.join(orphan_methods)}")
 
+    if redefinitions:
+        pairs = sorted({(old, new) for _, old, new in redefinitions})
+        print(f"ATTENTION : {len(redefinitions)} element(s) deja definis dans un AUTRE fichier "
+              f"du meme package ont ete REPRIS par ce fichier (meme nom, meme dossier) :")
+        for old, new in pairs:
+            names = [n for n, o, nw in redefinitions if (o, nw) == (old, new)]
+            print(f"    '{old}' -> '{new}' : {', '.join(names)}")
+        print("    Ces fichiers ne peuvent pas coexister dans un meme build proto (symboles en "
+              "double). A l'export, les elements repris ne ressortiront que dans le dernier "
+              "fichier importe. Supprimez l'un des deux fichiers, ou placez-les dans des "
+              "dossiers/packages distincts.")
+    if number_pvmt_missing:
+        domain_name, group_name = PVMT_FIELD_NUMBER_KEY.split(".")[0:2]
+        print(f"ATTENTION : numeros de champ NON stockes -- le groupe PVMT "
+              f"'{domain_name}.{group_name}' n'a pas de propriete 'FieldNumber' : "
+              f"l'export renumerotera les champs 1, 2, 3... (compatibilite binaire "
+              f"cassee si l'original a des trous ou un autre ordre).")
     if oneof_stored:
         print(f"INFO : appartenance aux oneof stockee via PVMT ({PVMT_ONEOF_KEY}).")
     if oneof_pvmt_missing:
@@ -907,6 +945,30 @@ if __name__ == "__main__":
         proto_files = [args.proto_path]
         proto_root = args.proto_root
 
+    # --- Phase 1 : validation de TOUS les fichiers par protoc, AVANT
+    #     d'ouvrir le modele. Un fichier invalide n'interrompt plus
+    #     l'import au milieu d'une arborescence : toutes les erreurs sont
+    #     listees d'un coup, et le modele n'est pas touche. protoc ecrit
+    #     ses erreurs lui-meme (chemin:ligne:colonne) juste au-dessus.
+    print("\nValidation des fichiers .proto (protoc)...", flush=True)
+    parsed, invalid = [], []
+    for proto_path in proto_files:
+        try:
+            parsed.append((proto_path, parse_proto_file(proto_path, proto_root=proto_root)))
+        except RuntimeError:
+            invalid.append(proto_path)
+    if invalid:
+        print(f"\nARRET : {len(invalid)} fichier(s) .proto invalide(s) (erreurs protoc "
+              f"ci-dessus) -- modele NON modifie :")
+        for pf in invalid:
+            print(f"    {pf}")
+        print("Corrigez ces fichiers puis relancez. Rappel : un type d'un AUTRE package "
+              "proto doit etre qualifie (ex: routeguide.Point), meme si son fichier est "
+              "dans le meme dossier.")
+        sys.exit(1)
+    print(f"OK : {len(parsed)} fichier(s) valide(s).")
+
+    # --- Phase 2 : import dans le modele
     model = capellambse.MelodyModel(args.model_path)
 
     if not check_pvmt_ready(model):
@@ -920,9 +982,8 @@ if __name__ == "__main__":
     total_services = 0
     total_files_processed = 0
 
-    for proto_path in proto_files:
+    for proto_path, proto_model in parsed:
         print(f"\n=== {proto_path} ===")
-        proto_model = parse_proto_file(proto_path, proto_root=proto_root)
 
         if args.strict_types:
             if not check_types_ready(data_pkg, proto_model):

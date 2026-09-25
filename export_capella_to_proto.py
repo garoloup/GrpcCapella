@@ -66,6 +66,7 @@ from proto_capella_types import (
     PVMT_HEADER_KEY,
     PVMT_COMMENT_STYLE_KEY,
     PVMT_ONEOF_KEY,
+    PVMT_FIELD_NUMBER_KEY,
 )
 
 LAYER_CHOICES = {"oa": "Operational Analysis", "sa": "System Analysis",
@@ -195,7 +196,10 @@ def class_to_proto_message(cls, needed_imports):
     lines = _as_comment_lines(cls)
     lines.append(f"message {cls.name} {{")
     entries = []
-    for counter, prop in enumerate(cls.owned_properties, start=1):
+    props = list(cls.owned_properties)
+    numbers = field_numbers(props, 1)
+    for prop in props:
+        counter = numbers[prop.uuid]
         multiplicity = "repeated " if is_repeated(prop) else ""
         type_name = proto_type_name(prop.type, needed_imports)
         extra_leading = []
@@ -209,14 +213,38 @@ def class_to_proto_message(cls, needed_imports):
     return "\n".join(lines)
 
 
+def field_numbers(elements, start):
+    """{uuid: numero} : numero d'origine (PVMT FieldNumber) quand il est
+    connu ; sinon, pour les elements importes avant ce mecanisme,
+    numerotation sequentielle a partir de start (1 pour un champ, 0 pour
+    une valeur d'enum), apres le plus grand numero deja pris -- pour ne
+    jamais creer de doublon."""
+    stored = {}
+    for e in elements:
+        try:
+            stored[e.uuid] = int(pvmt_get(e, PVMT_FIELD_NUMBER_KEY))
+        except (TypeError, ValueError):
+            pass
+    nxt = max(list(stored.values()) + [start - 1]) + 1
+    numbers = {}
+    for e in elements:
+        if e.uuid in stored:
+            numbers[e.uuid] = stored[e.uuid]
+        else:
+            numbers[e.uuid] = nxt
+            nxt += 1
+    return numbers
+
+
 def enum_to_proto(enum):
     """Regenere sequentiellement 0..N-1 (cf. limite documentee en tete
     de fichier : Capella ne stocke pas la valeur numerique proto).
     Commentaires courts alignes en fin de ligne (cf. _emit_aligned_block)."""
     lines = _as_comment_lines(enum)
     lines.append(f"enum {enum.name} {{")
-    entries = [(f"    {lit.name} = {number};", lit, None)
-               for number, lit in enumerate(enum.owned_literals)]
+    literals = list(enum.owned_literals)
+    numbers = field_numbers(literals, 0)
+    entries = [(f"    {lit.name} = {numbers[lit.uuid]};", lit, None) for lit in literals]
     lines.extend(_emit_aligned_block(entries))
     lines.append("}")
     return "\n".join(lines)
@@ -610,7 +638,7 @@ def class_to_proto_message_v2(cls, namer, indent=""):
 
     pending, emitted_oneofs = [], set()
     props = list(cls.owned_properties)
-    numbers = {p.uuid: n for n, p in enumerate(props, start=1)}
+    numbers = field_numbers(props, 1)
     for prop in props:
         oneof = _pvmt_str(prop, PVMT_ONEOF_KEY)
         if not oneof:

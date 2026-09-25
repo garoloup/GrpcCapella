@@ -70,7 +70,15 @@ python import_proto_to_capella.py my_protos_folder/ My_Model.aird [--strict-type
 ```
 
 Recursively walks the folder, imports every `.proto` file found (in a
-stable order), a single `model.save()` at the end. `--proto-root`
+stable order), a single `model.save()` at the end.
+
+**All files are first validated by `protoc`, before any change to the
+model.** If one is invalid, `protoc`'s errors (file, line, column) are
+shown, the faulty files are listed, and the import stops without touching
+the model. Common cause: a type from **another package** used without
+qualification. For example, `Point` defined in `route_guide.proto`
+(`package routeguide;`) must be written `routeguide.Point`, even when both
+files live in the same folder. `--proto-root`
 defaults to this folder if not given — generally what you want. Since
 the import is idempotent (§8), the order files are processed in
 doesn't matter: two files that reference each other converge to the
@@ -329,12 +337,12 @@ and export: a single edit covers both directions.
 
 ## 7. PVMT setup — once per project
 
-Six optional-but-useful pieces of information go through Capella's
+Seven optional-but-useful pieces of information go through Capella's
 PVMT extension: the gRPC streaming mode (§7.1, the only one of the
-six that blocks the import if missing), the original proto
+seven that blocks the import if missing), the original proto
 `package` (§7.2), the exact source file path (§7.3), the file header
-block (§7.4), the comment style (§7.5), and `oneof` membership
-(§7.6). None of these can be created by script: neither
+block (§7.4), the comment style (§7.5), `oneof` membership (§7.6), and
+field numbers (§7.7, **strongly recommended**). None of these can be created by script: neither
 Python4Capella nor `capellambse` support it (a deliberate limitation
 of both tools) — it's a one-time manual setup in Capella, via the
 **PV Definition Editor** (select any model element, open the
@@ -465,6 +473,24 @@ cardinality. **If absent**, `oneof` fields are exported as plain fields
 `ATTENTION`.
 
 
+### 7.7 Field numbers (strongly recommended)
+
+| Level | Name | Type |
+|---|---|---|
+| Domain | `Grpc` | — |
+| Group | `Metadata` (same as above) | — |
+| Property (inside Metadata) | `FieldNumber` | String |
+
+Records the original number of each field (`= 5`) and each enum value
+(`= 10`). This number, not the name, identifies a field on the gRPC wire:
+it must be restored **exactly**, gaps and order included, otherwise
+existing clients can no longer decode messages. **If absent**, export
+renumbers 1, 2, 3… (0, 1, 2… for an enum), which is only faithful for a
+gap-free file; the import flags it with an `ATTENTION`. For elements
+imported before this mechanism, export fills in with free numbers, never
+creating duplicates.
+
+
 ## 8. Re-importing: update vs duplication
 
 The import is **idempotent**, by name, within each Capella package
@@ -480,6 +506,7 @@ type); otherwise it creates it.
 | Re-importing the same file | No duplication, everything is simply updated. |
 | Modified version with an addition (new field/method/message/enum) | The new element is added alongside the existing ones. |
 | Modified version with a removal | The now-orphaned Capella element (missing from the new `.proto`) is **flagged** (`INFO : ... non supprimes`) but **never deleted automatically** — an automatic deletion could break a reference elsewhere in the model (e.g. a diagram). Remove it manually if needed. |
+| Two **different** files define a type with the same name in the same folder | Flagged by an `ATTENTION` naming both files and the elements taken over: the last imported file takes the elements over, and the other file will no longer come out on export. Such files cannot coexist in a single proto build anyway. |
 | Importing file B that was already pulled in transitively (via file A) | Finds the already-created elements in the right package, duplicates nothing — no matter which file you "enter" a proto module through, the end result converges. |
 
 The script also flags, for information, any Classes in a package that
@@ -490,12 +517,6 @@ import (pre-existing unrelated content) — expected if your `DataPkg`
 
 ## 9. Known limitations
 
-- **Field numbers are renumbered (important)**: the original numbers
-  (`= 5`) are not stored in Capella. Export renumbers fields 1, 2, 3… in
-  declaration order. That is faithful for a gap-free file, but **breaks
-  wire compatibility** if the original has gaps, removed fields, or a
-  different order. Same for enum values, regenerated from 0. To be
-  addressed first, before any production use.
 - **Enums nested inside a message**: not handled (Capella does not allow
   an `Enumeration` inside a `Class`); flagged with an `ATTENTION`, fields
   of that type are left untyped.
