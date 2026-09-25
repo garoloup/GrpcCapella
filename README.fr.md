@@ -71,7 +71,16 @@ python import_proto_to_capella.py mon_dossier_protos/ Mon_Modele.aird [--strict-
 ```
 
 Parcourt récursivement le dossier, importe chaque `.proto` trouvé (dans
-un ordre stable), un seul `model.save()` à la fin. `--proto-root` vaut
+un ordre stable), un seul `model.save()` à la fin.
+
+**Tous les fichiers sont d'abord validés par `protoc`, avant toute
+modification du modèle.** Si l'un d'eux est invalide, les erreurs de
+`protoc` (fichier, ligne, colonne) sont affichées, les fichiers fautifs
+sont listés, et l'import s'arrête sans toucher au modèle. Cause fréquente :
+un type d'un **autre package** utilisé sans qualification. Par exemple,
+`Point` défini dans `route_guide.proto` (`package routeguide;`) doit
+s'écrire `routeguide.Point`, même si les deux fichiers sont dans le même
+dossier. `--proto-root` vaut
 alors ce dossier par défaut si non précisé — généralement ce que vous
 voulez. Comme l'import est idempotent (§8), peu importe l'ordre dans
 lequel les fichiers sont traités : deux fichiers qui se référencent
@@ -159,8 +168,10 @@ impose `--output-root` ; les autres modes acceptent soit
 
 - `--layer` : restreint à une couche (et lève l'ambiguïté si une
   Interface du même nom existe dans plusieurs couches).
-- `--order` : `messages-first` (défaut : enums, puis messages, puis
-  services) ou `service-first`.
+- `--order` : `original` (défaut) reproduit l'ordre des déclarations du
+  fichier d'origine si la mise en forme a été stockée (§7.8), sinon
+  `messages-first` (enums, puis messages, puis services) ; `service-first`
+  place les services en tête.
 - `--package` : force le `package` écrit. Sans lui, il est relu depuis
   le PVMT (§7.2). En mode `--all`, à laisser vide.
 
@@ -175,8 +186,13 @@ toujours exportée dans l'ancien mode.
 groupe PVMT `Metadata` (par exemple les classes de l'Operational
 Analysis) sont simplement ignorés.
 
-Contenu régénéré, dans l'ordre : cartouche (§7.4), `syntax`, `import`,
-`package`, enums, messages, services. Dans les messages :
+Contenu régénéré : cartouche (§7.4), `syntax`, `import`, `package`, puis
+les déclarations. Avec la propriété `Layout` (§7.8), le fichier est
+reproduit **à l'identique** tant que le modèle n'a pas été modifié : ordre
+des déclarations, commentaire de présentation du fichier, styles de
+commentaires, lignes vides, indentation, lignes `option`, déclarations
+compactes sur une ligne. Sans elle : enums, messages, puis services, avec
+une mise en forme normalisée. Dans les messages :
 
 | Proto | Représentation Capella | Régénéré |
 |---|---|---|
@@ -335,12 +351,13 @@ sens.
 
 ## 7. Procédure PVMT — à faire une fois par projet
 
-Six informations optionnelles-mais-utiles passent par l'extension
-PVMT de Capella : le mode de streaming gRPC (§7.1, la seule des six
+Huit informations optionnelles-mais-utiles passent par l'extension
+PVMT de Capella : le mode de streaming gRPC (§7.1, la seule des huit
 qui bloque l'import si absente), le `package` proto d'origine (§7.2),
 le chemin de fichier d'origine exact (§7.3), le cartouche d'en-tête
-(§7.4), le style des commentaires (§7.5) et l'appartenance aux
-`oneof` (§7.6). Aucune ne peut être créée par script : ni Python4Capella ni
+(§7.4), le style des commentaires (§7.5), l'appartenance aux
+`oneof` (§7.6) les numéros de champ (§7.7, **fortement recommandé**) et la
+mise en forme d'origine (§7.8). Aucune ne peut être créée par script : ni Python4Capella ni
 `capellambse` ne le permettent (limite volontaire des deux outils) —
 c'est une configuration manuelle à faire une fois dans Capella, via le
 **PV Definition Editor** (sélectionnez un élément du modèle, ouvrez la
@@ -449,9 +466,9 @@ d'enum, `Interface`, `Service`) :
 ligne (aligné en colonne), dans son style d'origine (`// `, `/// ` ou
 `/* */`) ; un commentaire multi-lignes est restitué au-dessus de
 l'élément dans son style. Absente, l'export utilise `//` partout
-(comportement antérieur). Seul écart connu : dans un encadré, les
-espaces de remplissage au-delà de la ligne la plus longue ne sont pas
-conservés (les `*/` restent alignés entre eux).
+(comportement antérieur). Les styles atypiques (marqueurs `/*` `*/` seuls
+sur leur ligne, lignes sans indentation, `//` sans espace…) sont restitués
+à l'identique grâce au texte brut mémorisé dans `Layout` (§7.8).
 
 
 ### 7.6 Groupes `oneof` (optionnel)
@@ -471,6 +488,61 @@ comme des champs simples (fichier valide, mais l'exclusivité mutuelle est
 perdue) ; l'import l'indique par un `ATTENTION`.
 
 
+### 7.7 Numéros de champ (fortement recommandé)
+
+| Niveau | Nom | Type |
+|---|---|---|
+| Domain | `Grpc` | — |
+| Group | `Metadata` (le même que ci-dessus) | — |
+| Property (dans Metadata) | `FieldNumber` | String |
+
+Mémorise le numéro d'origine de chaque champ (`= 5`) et de chaque valeur
+d'enum (`= 10`). C'est ce numéro, et non le nom, qui identifie un champ sur
+le fil gRPC : il doit être restitué **à l'identique**, trous et ordre
+compris, sinon les clients existants ne peuvent plus décoder les messages.
+**Absente**, l'export renumérote 1, 2, 3… (0, 1, 2… pour un enum), ce qui
+n'est fidèle que pour un fichier numéroté sans trou ; l'import l'indique
+par un `ATTENTION`. Pour des éléments importés avant ce mécanisme,
+l'export complète avec des numéros libres, sans jamais créer de doublon.
+
+
+### 7.8 Mise en forme d'origine (recommandé)
+
+| Niveau | Nom | Type |
+|---|---|---|
+| Domain | `Grpc` | — |
+| Group | `Metadata` (le même que ci-dessus) | — |
+| Property (dans Metadata) | `Layout` | String |
+
+Contenu technique (JSON), non destiné à être édité dans Capella. Il
+regroupe tout ce qui relève de la présentation du fichier, pour une
+régénération **au caractère près** :
+
+- **l'ordre des déclarations**, dans le fichier (enums, messages et
+  services entrelacés) et dans chaque message (champs, messages imbriqués,
+  `oneof`) ;
+- **le commentaire de présentation du fichier**, et plus généralement tout
+  bloc de commentaire séparé d'une déclaration par une ligne vide ;
+- **le texte brut des commentaires** dont le style n'est pas reproductible
+  par un rendu standard, leur position (au-dessus ou en fin de ligne) et
+  la colonne des commentaires de fin de ligne ;
+- **les lignes vides**, **l'unité d'indentation** du fichier (2 espaces,
+  4, tabulation) et **la forme des `rpc`** (`;` ou `{}`) ;
+- **l'en-tête `syntax` … `package`** tel qu'écrit, lignes `option` et ordre
+  des `import` compris ;
+- **les déclarations compactes** (`message A { int32 a = 1; }`).
+
+**Robustesse aux modifications dans Capella** : le texte brut d'un
+commentaire n'est réutilisé que tant que la description n'a pas changé ;
+une description modifiée est rendue dans le style détecté. De même,
+l'en-tête d'origine n'est réutilisé que si les imports et le package
+exigés par le modèle sont inchangés ; sinon il est régénéré, et les lignes
+`option` sont alors perdues.
+
+**Absente**, l'export reste correct (fichier valide, sémantique
+identique), mais avec une mise en forme normalisée.
+
+
 ## 8. Ré-import : mise à jour vs duplication
 
 L'import est **idempotent**, par nom, dans chaque package Capella
@@ -486,6 +558,7 @@ type) ; sinon il le crée.
 | Ré-import du même fichier | Aucune duplication, tout est simplement mis à jour. |
 | Version modifiée avec ajout (nouveau champ/méthode/message/enum) | Le nouvel élément est ajouté aux existants. |
 | Version modifiée avec suppression | L'élément Capella devenu orphelin (absent du nouveau `.proto`) est **signalé** (`INFO : ... non supprimes`) mais **jamais supprimé automatiquement** — une suppression auto pourrait casser une référence ailleurs dans le modèle (un diagramme, par exemple). À vous de le retirer manuellement si besoin. |
+| Deux fichiers **différents** définissent un type de même nom dans le même dossier | Signalé par un `ATTENTION` qui nomme les deux fichiers et les éléments repris : le dernier fichier importé reprend les éléments, et l'autre fichier ne ressortira plus à l'export. Ces fichiers ne peuvent de toute façon pas coexister dans un même build proto. |
 | Import d'un fichier B qui était déjà importé transitivement (via un fichier A) | Retrouve les éléments déjà créés dans le bon package, ne duplique rien — peu importe par quel fichier vous « entrez » dans un module proto, le résultat final converge. |
 
 Le script signale aussi, à titre indicatif, les Classes d'un package
@@ -496,18 +569,12 @@ sous-package) contient d'autres éléments.
 
 ## 9. Limites connues
 
-- **Numéros de champ renumérotés (important)** : les numéros d'origine
-  (`= 5`) ne sont pas stockés dans Capella. L'export renumérote les champs
-  1, 2, 3… dans l'ordre de déclaration. C'est fidèle pour un fichier
-  numéroté sans trou, mais **casse la compatibilité binaire** si
-  l'original a des trous, des champs supprimés ou un ordre différent. Idem
-  pour les valeurs d'enum, régénérées depuis 0. À traiter en priorité
-  avant tout usage en production.
 - **Enums imbriqués dans un message** : non gérés (Capella n'autorise pas
   une `Enumeration` dans une `Class`) ; signalés par un `ATTENTION`, les
   champs de ce type restent sans type.
-- **`reserved` et options** (`[deprecated = true]`, `option java_package`…) :
-  non conservés.
-- **Mise en forme** : la colonne d'alignement des commentaires de fin de
-  ligne est recalculée, les lignes vides multiples sont normalisées, et
-  les enums sont placés avant les messages.
+- **`reserved` et options de champ** (`[deprecated = true]`) : non
+  conservés. Les lignes `option` de niveau fichier ne le sont que tant que
+  l'en-tête d'origine est réutilisable (§7.8).
+- **Un package Capella = un dossier** : deux fichiers d'un même dossier ne
+  peuvent pas définir des types de même nom, même dans des packages proto
+  différents ; l'import le signale (§8).
