@@ -60,81 +60,162 @@ def _find_comment_start(line):
     return -1
 
 
+def _block_start(lines, j):
+    """Index de la ligne ouvrant ('/*') le bloc qui se ferme en ligne j, ou
+    None. Le bloc doit commencer EN DEBUT DE LIGNE (sans code avant) : une
+    ligne 'int32 b = 2;   /* fin de ligne */' se termine aussi par '*/',
+    mais c'est un commentaire de fin de ligne du champ b, pas un
+    commentaire place au-dessus de l'element suivant."""
+    k = j
+    while k >= 0:
+        if "/*" in lines[k]:
+            return k if lines[k].strip().startswith("/*") else None
+        k -= 1
+    return None
+
+
+def leading_block(lines, elem_line):
+    """Lignes BRUTES du commentaire colle au-dessus de elem_line (0-based) :
+    (index_de_debut, [lignes]) ou (elem_line, []) s'il n'y en a pas.
+    Regroupe des lignes // successives, ou des blocs /* */ successifs
+    (un bloc multi-lignes, ou plusieurs /* */ d'une ligne = encadre)."""
+    i = elem_line - 1
+    if i < 0 or not lines[i].strip():
+        return elem_line, []
+    s = lines[i].strip()
+    if s.startswith("//"):
+        j = i
+        while j >= 0 and lines[j].strip().startswith("//"):
+            j -= 1
+        return j + 1, lines[j + 1:elem_line]
+    if s.endswith("*/"):
+        j = i
+        start = None
+        while j >= 0 and lines[j].strip().endswith("*/"):
+            k = _block_start(lines, j)
+            if k is None:
+                break
+            start = k
+            j = k - 1
+            # on ne regroupe que des blocs ADJACENTS (pas de ligne vide)
+            if j < 0 or not lines[j].strip():
+                break
+        if start is None:
+            return elem_line, []
+        return start, lines[start:elem_line]
+    return elem_line, []
+
+
+def clean_leading(raw_lines):
+    """Texte propre + style d'un commentaire brut (liste de lignes).
+    Style = celui dont le rendu s'en approche le plus ; si le rendu ne
+    reproduit pas le brut a l'identique, l'appelant conserve le brut."""
+    block = [l.rstrip() for l in raw_lines]
+    stripped = [l.strip() for l in block]
+    if not block:
+        return "", None
+
+    if all(l.startswith("//") for l in stripped):
+        style = "///" if all(l.startswith("///") for l in stripped) else "//"
+        text = []
+        for l in stripped:
+            t = l[len(style):]
+            text.append(t[1:] if t.startswith(" ") else t)
+        return "\n".join(t.rstrip() for t in text).strip("\n"), style
+
+    # encadre : plusieurs /* ... */ complets, un par ligne
+    if len(stripped) > 1 and all(l.startswith("/*") and l.endswith("*/") and len(l) >= 4
+                                 for l in stripped):
+        inners = [l[2:-2] for l in stripped]
+        has_border = _is_border(inners[0]) and _is_border(inners[-1])
+        if has_border:
+            inners = inners[1:-1]
+        text = "\n".join(x.strip() for x in inners if not _is_border(x))
+        return text, ("boxed_border" if has_border else "boxed")
+
+    # bloc /* ... */ (une ou plusieurs lignes, marqueurs n'importe ou)
+    body = "\n".join(stripped)
+    is_javadoc = body.startswith("/**") and not body.startswith("/**/")
+    body = body[3:] if is_javadoc else body[2:]
+    if body.endswith("*/"):
+        body = body[:-2]
+    lines_ = [l.strip() for l in body.split("\n")]
+    inner = [l for l in lines_ if l]
+    # lignes prefixees par '*' (style javadoc, meme avec une ouverture '/*')
+    if inner and all(l.startswith("*") for l in inner):
+        lines_ = [(l[1:][1:] if l[1:].startswith(" ") else l[1:]) if l.startswith("*") else l
+                  for l in lines_]
+    while lines_ and not lines_[0].strip():
+        lines_.pop(0)
+    while lines_ and not lines_[-1].strip():
+        lines_.pop()
+    return "\n".join(l.rstrip() for l in lines_), ("javadoc" if is_javadoc else "block")
+
+
 def extract_leading(lines, elem_line):
     """Commentaire colle AU-DESSUS de la ligne elem_line (0-based).
     Retourne (texte_propre, style) ou ("", None)."""
-    i = elem_line - 1
-    if i < 0 or not lines[i].strip():
+    _, raw = leading_block(lines, elem_line)
+    if not raw:
         return "", None
-    last = lines[i].strip()
+    text, style = clean_leading(raw)
+    return (text, style) if text else ("", None)
 
-    # --- Commentaires // ou /// sur lignes successives ---------------
-    if last.startswith("//"):
-        block = []
-        while i >= 0 and lines[i].strip().startswith("//"):
-            block.insert(0, lines[i].strip())
+
+def detached_block(lines, first_line):
+    """Commentaire(s) DETACHE(S) au-dessus d'un element : separes de lui
+    (ou de son commentaire colle, qui commence en first_line) par au moins
+    une ligne vide, et remontant jusqu'a la ligne de code precedente
+    (package, import, '}'...). Ex : le bloc de presentation d'un fichier,
+    place apres les imports. Retourne (lignes_brutes, nb_lignes_vides_entre
+    ce bloc et l'element) ou ([], 0)."""
+    i = first_line - 1
+    if i < 0 or lines[i].strip():
+        return [], 0
+    gap = 0
+    while i >= 0 and not lines[i].strip():
+        gap += 1
+        i -= 1
+    end = i
+    collected_start = None
+    while i >= 0:
+        s = lines[i].strip()
+        if not s:
             i -= 1
-        style = "///" if all(l.startswith("///") for l in block) else "//"
-        prefix = len(style)
-        text = [l[prefix:][1:] if l[prefix:].startswith(" ") else l[prefix:] for l in block]
-        return "\n".join(t.rstrip() for t in text).strip("\n"), style
-
-    if not last.endswith("*/"):
-        return "", None
-
-    # --- Encadre : un /* ... */ complet par ligne ---------------------
-    if last.startswith("/*"):
-        boxed = []
-        j = i
-        while j >= 0:
-            s = lines[j].strip()
-            if s.startswith("/*") and s.endswith("*/") and len(s) >= 4:
-                boxed.insert(0, s)
-                j -= 1
-            else:
+            continue
+        if s.startswith("//"):
+            collected_start = i
+            i -= 1
+            continue
+        if s.endswith("*/"):
+            k = _block_start(lines, i)
+            if k is None:
                 break
-        if len(boxed) > 1:
-            inners = [b[2:-2] for b in boxed]
-            has_border = _is_border(inners[0]) and _is_border(inners[-1])
-            if has_border:
-                inners = inners[1:-1]
-            text = "\n".join(x.strip() for x in inners if not _is_border(x))
-            return text, ("boxed_border" if has_border else "boxed")
-        # un seul /* ... */ sur une ligne : bloc simple sur une ligne
-        inner = last[2:-2]
-        if inner.startswith("*"):  # /** texte */
-            inner = inner[1:]
-        return inner.strip(), "block"
+            collected_start = k
+            i = k - 1
+            continue
+        break
+    if collected_start is None or end < 0:
+        return [], 0
+    return [l.rstrip() for l in lines[collected_start:end + 1]], gap
 
-    # --- Bloc /* ... */ englobant plusieurs lignes --------------------
-    block = []
-    j = i
-    while j >= 0:
-        block.insert(0, lines[j].rstrip())
-        if "/*" in lines[j]:
-            break
-        j -= 1
-    else:
-        return "", None
-    first = block[0].strip()
-    is_javadoc = first.startswith("/**")
-    body = []
-    for k, l in enumerate(block):
-        s = l.strip()
-        if k == 0:
-            s = s[3:] if is_javadoc else s[2:]
-        if k == len(block) - 1:
-            s = s[:-2] if s.endswith("*/") else s
-        s = s.rstrip()
-        if is_javadoc and s.lstrip().startswith("*"):
-            s = s.lstrip()[1:]
-            s = s[1:] if s.startswith(" ") else s
-        body.append(s.strip() if not is_javadoc else s.rstrip())
-    while body and not body[0].strip():
-        body.pop(0)
-    while body and not body[-1].strip():
-        body.pop()
-    return "\n".join(b.strip() for b in body), ("javadoc" if is_javadoc else "block")
+
+def dedent(raw_lines):
+    """Retire l'indentation commune (conservee relative), pour stocker un
+    commentaire brut independamment de sa profondeur d'imbrication."""
+    widths = [len(l) - len(l.lstrip()) for l in raw_lines if l.strip()]
+    cut = min(widths) if widths else 0
+    return [l[cut:] if l.strip() else "" for l in raw_lines]
+
+
+def reindent(raw_text, indent):
+    return [f"{indent}{l}" if l.strip() else "" for l in raw_text.split("\n")]
+
+
+def text_of_raw_leading(raw_text):
+    """Texte propre d'un commentaire brut stocke (pour detecter si la
+    description Capella a ete modifiee depuis l'import)."""
+    return clean_leading(raw_text.split("\n"))[0]
 
 
 def extract_trailing(lines, elem_end_line):
@@ -146,13 +227,31 @@ def extract_trailing(lines, elem_end_line):
     idx = _find_comment_start(line)
     if idx < 0 or not line[:idx].strip():
         return "", None  # pas de code avant : ce n'est pas un commentaire de fin de ligne
-    c = line[idx:].rstrip()
+    return _clean_trailing(line[idx:].rstrip())
+
+
+def _clean_trailing(c):
     if c.startswith("///"):
         return c[3:].strip(), "///"
     if c.startswith("//"):
         return c[2:].strip(), "//"
     inner = c[2:-2] if c.endswith("*/") else c[2:]
     return inner.strip(), "block"
+
+
+def trailing_raw(lines, elem_end_line):
+    """(colonne, texte_brut) du commentaire de fin de ligne, ou (None, "")."""
+    if elem_end_line < 0 or elem_end_line >= len(lines):
+        return None, ""
+    line = lines[elem_end_line]
+    idx = _find_comment_start(line)
+    if idx < 0 or not line[:idx].strip():
+        return None, ""
+    return idx, line[idx:].rstrip()
+
+
+def text_of_raw_trailing(raw):
+    return _clean_trailing(raw)[0]
 
 
 def extract_header(lines, syntax_line):

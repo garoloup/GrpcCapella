@@ -39,6 +39,7 @@ from grpc_tools import protoc
 from google.protobuf import descriptor_pb2
 import tempfile
 import posixpath
+import json
 import os
 
 from proto_capella_types import (
@@ -57,6 +58,7 @@ from proto_capella_types import (
     PVMT_COMMENT_STYLE_KEY,
     PVMT_ONEOF_KEY,
     PVMT_FIELD_NUMBER_KEY,
+    PVMT_LAYOUT_KEY,
 )
 from setup_primitive_types import ensure_primitive_types
 
@@ -102,7 +104,7 @@ def _build_comment_index(file_proto, source_lines):
       [6, i] / [6, i, 2, j]  -> service / methode (rpc)
     Repli si source_lines est None : texte protoc nettoye, style "//".
     """
-    texts, styles = {}, {}
+    texts, styles, layouts = {}, {}, {}
     for loc in file_proto.source_code_info.location:
         path = tuple(loc.path)
         # longueur paire = un element (message, champ, enum, valeur, service,
@@ -110,18 +112,116 @@ def _build_comment_index(file_proto, source_lines):
         if not path or path[0] not in (4, 5, 6) or len(path) % 2:
             continue
         if source_lines is not None and loc.span:
-            start = loc.span[0]
-            end = loc.span[2] if len(loc.span) == 4 else loc.span[0]
-            text, style = proto_comments.extract_leading(source_lines, start)
-            if not text:
-                text, style = proto_comments.extract_trailing(source_lines, end)
+            text, style, layout = _comment_and_layout(source_lines, loc.span)
+            if path[0] == 6 and len(path) == 4:  # rpc : fin telle qu'ecrite (';' ou ' {}')
+                end = loc.span[2] if len(loc.span) == 4 else loc.span[0]
+                code = source_lines[end]
+                cut = proto_comments._find_comment_start(code)
+                code = (code[:cut] if cut >= 0 else code).rstrip()
+                close = code.rfind(")")
+                if close >= 0 and code[close + 1:].strip() not in ("", ";"):
+                    layout["rpc_end"] = code[close + 1:]
+            layouts[path] = layout
         else:
             raw = (loc.leading_comments or loc.trailing_comments or "").strip()
             text, style = _clean_protoc_comment(raw), proto_comments.DEFAULT_STYLE
         if text:
             texts[path] = text
             styles[path] = style or proto_comments.DEFAULT_STYLE
-    return texts, styles
+    return texts, styles, layouts
+
+
+def _file_level_layout(file_proto, lines, layouts):
+    """Mise en forme de niveau FICHIER (stockee sur chaque declaration de
+    niveau fichier) :
+      preamble  texte brut de 'syntax' jusqu'a la 1re declaration (imports,
+                package, lignes 'option', commentaires, lignes vides) --
+                reutilise tel quel a l'export si imports et package n'ont
+                pas change, ce qui conserve aussi les 'option'
+      indent    unite d'indentation du fichier (2 espaces, 4, tabulation...)"""
+    if lines is None:
+        return {}
+    out = {}
+    tops = [lay for p, lay in layouts.items() if len(p) == 2 and "top" in lay]
+    syntax_line = next((loc.span[0] for loc in file_proto.source_code_info.location
+                        if list(loc.path) == [12] and loc.span), None)
+    if syntax_line is not None and tops:
+        end = min(lay["top"] for lay in tops)
+        region = [l.rstrip() for l in lines[syntax_line:end]]
+        while region and not region[-1].strip():
+            region.pop()
+        out["preamble"] = "\n".join(region)
+    for lay in sorted(tops, key=lambda l: l["order"]):
+        for j in range(lay["order"] + 1, len(lines)):
+            l = lines[j]
+            if l.strip() and l.strip() != "}":
+                ind = l[:len(l) - len(l.lstrip())]
+                if ind:
+                    out["indent"] = ind
+                break
+        if "indent" in out:
+            break
+    return out
+
+
+def _comment_and_layout(lines, span):
+    """Commentaire d'un element (texte propre + style) et sa MISE EN FORME
+    d'origine, stockee dans le PVMT Layout pour une regeneration a
+    l'identique :
+      order    ligne de declaration (ordre des declarations dans le fichier
+               et dans un message)
+      pos      'leading' (au-dessus) ou 'trailing' (fin de ligne)
+      raw      texte BRUT du commentaire, seulement si le rendu standard du
+               style detecte ne le reproduit pas exactement (styles
+               atypiques : marqueurs seuls sur leur ligne, pas d'espace...)
+      col      colonne d'un commentaire de fin de ligne
+      detached bloc de commentaire separe par une ligne vide (ex : texte de
+               presentation du fichier, apres les imports) ; dgap = lignes
+               vides entre ce bloc et l'element
+      blank    lignes vides avant l'element (commentaires compris)"""
+    start = span[0]
+    end = span[2] if len(span) == 4 else span[0]
+    layout = {"order": start}
+    elem_indent = lines[start][:len(lines[start]) - len(lines[start].lstrip())]
+
+    # Element precede de code sur sa ligne (ex: champ de
+    # 'message A { int32 a = 1; }') : ni commentaire au-dessus (c'est celui
+    # du message), ni commentaire de fin de ligne (idem), ni bloc detache.
+    if lines[start][:span[1]].strip():
+        return "", None, {"order": start}
+    # declaration compacte sur une seule ligne : 'message A { int32 a = 1; }'
+    if len(span) == 3 and "{" in lines[start]:
+        layout["oneline"] = True
+
+    first_line, raw_lead = proto_comments.leading_block(lines, start)
+    text, style = "", None
+    if raw_lead:
+        text, style = proto_comments.clean_leading(raw_lead)
+        layout["pos"] = "leading"
+        if proto_comments.render_leading(text, style, elem_indent) != [l.rstrip() for l in raw_lead]:
+            layout["raw"] = "\n".join(proto_comments.dedent(raw_lead))
+    else:
+        col, raw_t = proto_comments.trailing_raw(lines, end)
+        if raw_t:
+            text, style = proto_comments.text_of_raw_trailing(raw_t), None
+            style = proto_comments._clean_trailing(raw_t)[1]
+            layout["pos"], layout["col"] = "trailing", col
+            if proto_comments.render_trailing(text, style) != raw_t:
+                layout["raw"] = raw_t
+
+    detached, dgap = proto_comments.detached_block(lines, first_line)
+    top = first_line
+    if detached:
+        layout["detached"] = "\n".join(proto_comments.dedent(detached))
+        layout["dgap"] = dgap
+        top = first_line - dgap - len(detached)
+    blank, k = 0, top - 1
+    while k >= 0 and not lines[k].strip():
+        blank += 1
+        k -= 1
+    layout["blank"] = blank
+    layout["top"] = top - blank  # 1re ligne du bloc (lignes vides comprises) -- sert a delimiter l'en-tete
+    return text, style, layout
 
 
 def _extract_header_comment(file_proto, source_lines):
@@ -188,7 +288,7 @@ def _relative_source_path(file_proto_name, real_path, base_dir):
     return file_proto_name
 
 
-def _parse_message(msg, path, qual_prefix, comments, style, nested_enums):
+def _parse_message(msg, path, qual_prefix, comments, style, nested_enums, layout):
     """Message -> dict, RECURSIF pour les messages imbriques (dont les
     entrees de map, que protoc represente comme un message imbrique
     'NomEntry' avec l'option map_entry). Chemins SourceCodeInfo :
@@ -208,7 +308,7 @@ def _parse_message(msg, path, qual_prefix, comments, style, nested_enums):
             "repeated": f.label == descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
             "optional": is_optional,
             "oneof": oneof,
-            "comment": comments.get(path + (2, j), ""), "comment_style": style(path + (2, j)),
+            "comment": comments.get(path + (2, j), ""), "comment_style": style(path + (2, j)), "layout": layout(path + (2, j)),
         })
     for k in range(len(msg.enum_type)):
         nested_enums.append(f"{qual}.{msg.enum_type[k].name}")
@@ -217,9 +317,9 @@ def _parse_message(msg, path, qual_prefix, comments, style, nested_enums):
         "qualified_name": qual,
         "map_entry": bool(msg.options.map_entry),
         "fields": fields,
-        "nested": [_parse_message(n, path + (3, k), qual, comments, style, nested_enums)
+        "nested": [_parse_message(n, path + (3, k), qual, comments, style, nested_enums, layout)
                    for k, n in enumerate(msg.nested_type)],
-        "comment": comments.get(path, ""), "comment_style": style(path),
+        "comment": comments.get(path, ""), "comment_style": style(path), "layout": layout(path),
     }
 
 
@@ -274,14 +374,24 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
     for file_proto in fds.file:
         real_path = _resolve_source_path(file_proto.name, include_dirs)
         source_lines = _read_source_lines(real_path)
-        comments, comment_styles = _build_comment_index(file_proto, source_lines)
+        comments, comment_styles, layouts = _build_comment_index(file_proto, source_lines)
         style = lambda path: comment_styles.get(path, proto_comments.DEFAULT_STYLE)
+        imports_as_written = list(file_proto.dependency)
+
+        file_level = _file_level_layout(file_proto, source_lines, layouts)
+
+        def layout(path):
+            lay = dict(layouts.get(path, {}))
+            if len(path) == 2 and lay:  # declaration de niveau fichier : + donnees du fichier
+                lay["imports"] = imports_as_written
+                lay.update(file_level)
+            return lay
         rel_path = _relative_source_path(file_proto.name, real_path, base_dir)
         folder = posixpath.dirname(rel_path)  # ex: "service_base_api", "google/protobuf", ou "" (racine)
         qual_prefix = f".{file_proto.package}" if file_proto.package else ""
         nested_enums = []
 
-        messages = [_parse_message(msg, (4, i), qual_prefix, comments, style, nested_enums)
+        messages = [_parse_message(msg, (4, i), qual_prefix, comments, style, nested_enums, layout)
                     for i, msg in enumerate(file_proto.message_type)]
 
         # Enums de premier niveau seulement (pas les enums imbriques
@@ -292,13 +402,13 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
             for j, v in enumerate(en.value):
                 values.append({
                     "name": v.name, "number": v.number,
-                    "comment": comments.get((5, i, 2, j), ""), "comment_style": style((5, i, 2, j)),
+                    "comment": comments.get((5, i, 2, j), ""), "comment_style": style((5, i, 2, j)), "layout": layout((5, i, 2, j)),
                 })
             enums.append({
                 "name": en.name,
                 "qualified_name": f".{file_proto.package}.{en.name}" if file_proto.package else f".{en.name}",
                 "values": values,
-                "comment": comments.get((5, i), ""), "comment_style": style((5, i)),
+                "comment": comments.get((5, i), ""), "comment_style": style((5, i)), "layout": layout((5, i)),
             })
 
         services = []
@@ -311,11 +421,11 @@ def parse_proto_file(proto_path, extra_include_dirs=None, proto_root=None):
                     "output_type": m.output_type,  # idem
                     "client_streaming": bool(m.client_streaming),
                     "server_streaming": bool(m.server_streaming),
-                    "comment": comments.get((6, i, 2, j), ""), "comment_style": style((6, i, 2, j)),
+                    "comment": comments.get((6, i, 2, j), ""), "comment_style": style((6, i, 2, j)), "layout": layout((6, i, 2, j)),
                 })
             services.append({
                 "name": svc.name, "methods": methods,
-                "comment": comments.get((6, i), ""), "comment_style": style((6, i)),
+                "comment": comments.get((6, i), ""), "comment_style": style((6, i)), "layout": layout((6, i)),
             })
 
         files.append({
@@ -483,6 +593,8 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
     number_stored = False
     number_pvmt_missing = False
     redefinitions = []
+    layout_stored = False
+    layout_pvmt_missing = False
 
     def set_source_file(element, path):
         """Pose PVMT_SOURCE_FILE_KEY sur un element (Class/Enumeration/
@@ -551,6 +663,17 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
         except PVMT_WRITE_ERRORS:
             number_pvmt_missing = True
 
+    def set_layout(element, layout):
+        """Pose PVMT_LAYOUT_KEY (mise en forme d'origine, JSON)."""
+        nonlocal layout_stored, layout_pvmt_missing
+        if not layout:
+            return
+        try:
+            element.pvmt[PVMT_LAYOUT_KEY] = json.dumps(layout, ensure_ascii=False)
+            layout_stored = True
+        except PVMT_WRITE_ERRORS:
+            layout_pvmt_missing = True
+
     def set_header(element, header):
         """Pose PVMT_HEADER_KEY (cartouche licence/copyright), optionnel,
         seulement si le fichier en a effectivement un."""
@@ -590,6 +713,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
         target_data_pkg = get_or_create_package_path(data_pkg, file_info["folder"], data_pkg_cache)
         for en in file_info["enums"]:
             capella_enum, is_new = _get_or_create(target_data_pkg.enumerations, en["name"])
+            set_layout(capella_enum, en["layout"])
             stats["created" if is_new else "updated"] += 1
             if en["comment"]:
                 capella_enum.description = en["comment"]
@@ -599,6 +723,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             set_package(capella_enum, file_info["package"])
             for value in en["values"]:
                 lit, _ = _get_or_create(capella_enum.owned_literals, value["name"])
+                set_layout(lit, value["layout"])
                 set_field_number(lit, value["number"])
                 if value["comment"]:
                     lit.description = value["comment"]
@@ -617,6 +742,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             dont les entrees de map 'NomEntry')."""
             for msg in messages:
                 capella_class, is_new = _get_or_create(container, msg["name"])
+                set_layout(capella_class, msg["layout"])
                 stats["created" if is_new else "updated"] += 1
                 if msg["comment"]:
                     capella_class.description = msg["comment"]
@@ -650,6 +776,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
 
                 for field in msg["fields"]:
                     prop, _ = _get_or_create(capella_class.owned_properties, field["name"])
+                    set_layout(prop, field["layout"])
                     if field["comment"]:
                         prop.description = field["comment"]
                         set_comment_style(prop, field["comment_style"])
@@ -690,6 +817,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
 
         for svc in file_info["services"]:
             capella_interface, is_new = _get_or_create(target_interface_pkg.interfaces, svc["name"])
+            set_layout(capella_interface, svc["layout"])
             stats["created" if is_new else "updated"] += 1
             if svc["comment"]:
                 capella_interface.description = svc["comment"]
@@ -709,6 +837,7 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
             for method in svc["methods"]:
                 operation, op_is_new = _get_or_create(
                     capella_interface.owned_features, method["name"], typehint="Service")
+                set_layout(operation, method["layout"])
                 if method["comment"]:
                     operation.description = method["comment"]
                     set_comment_style(operation, method["comment_style"])
@@ -744,6 +873,12 @@ def import_proto_model(proto_model, data_pkg, interface_pkg, model):
                 print(f"INFO : Interface '{svc['name']}' contient des operations absentes "
                       f"de ce .proto (non supprimees) : {', '.join(orphan_methods)}")
 
+    if layout_pvmt_missing:
+        domain_name, group_name = PVMT_LAYOUT_KEY.split(".")[0:2]
+        print(f"INFO : mise en forme d'origine NON stockee -- le groupe PVMT "
+              f"'{domain_name}.{group_name}' n'a pas de propriete 'Layout' (optionnel) : "
+              f"l'export ne pourra pas reproduire l'ordre des declarations, les "
+              f"commentaires atypiques ni le commentaire de presentation du fichier.")
     if redefinitions:
         pairs = sorted({(old, new) for _, old, new in redefinitions})
         print(f"ATTENTION : {len(redefinitions)} element(s) deja definis dans un AUTRE fichier "

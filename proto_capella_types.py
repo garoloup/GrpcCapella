@@ -171,3 +171,13 @@ PVMT_WRITE_ERRORS = (KeyError, _ScopeError.__mro__[1])
 # change le format sur le fil des qu'il y a un trou ou un ordre
 # different dans l'original.
 PVMT_FIELD_NUMBER_KEY = "Grpc.Metadata.FieldNumber"
+
+
+# PVMT optionnel (String, contenu JSON) : MISE EN FORME d'origine d'un
+# element, pour regenerer le fichier a l'identique -- ordre des
+# declarations, position/texte brut/colonne des commentaires, bloc de
+# commentaire detache (ex: presentation du fichier apres les imports),
+# lignes vides, ordre des imports. Purement technique, non destine a etre
+# edite dans Capella. Un seul champ pour toute la mise en forme : de
+# futurs ajouts n'exigeront pas de nouvelle propriete PVMT.
+PVMT_LAYOUT_KEY = "Grpc.Metadata.Layout"

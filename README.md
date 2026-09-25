@@ -164,8 +164,9 @@ an explicit output path.
 
 - `--layer`: restricts to one layer (and disambiguates an Interface name
   that exists in several layers).
-- `--order`: `messages-first` (default: enums, then messages, then
-  services) or `service-first`.
+- `--order`: `original` (default) reproduces the original declaration
+  order if the layout was stored (§7.8), otherwise `messages-first` (enums,
+  then messages, then services); `service-first` puts services first.
 - `--package`: forces the `package` written. Without it, it is read back
   from PVMT (§7.2). In `--all` mode, leave it blank.
 
@@ -180,8 +181,12 @@ always exported the old way.
 `Metadata` PVMT group (e.g. Operational Analysis classes) are simply
 skipped.
 
-Regenerated content, in order: header (§7.4), `syntax`, `import`,
-`package`, enums, messages, services. Inside messages:
+Regenerated content: header (§7.4), `syntax`, `import`, `package`, then
+the declarations. With the `Layout` property (§7.8), the file is
+reproduced **identically** as long as the model has not been changed:
+declaration order, file description comment, comment styles, blank lines,
+indentation, `option` lines, compact one-line declarations. Without it:
+enums, messages, then services, with normalized formatting. Inside messages:
 
 | Proto | Capella representation | Regenerated as |
 |---|---|---|
@@ -337,12 +342,12 @@ and export: a single edit covers both directions.
 
 ## 7. PVMT setup — once per project
 
-Seven optional-but-useful pieces of information go through Capella's
+Eight optional-but-useful pieces of information go through Capella's
 PVMT extension: the gRPC streaming mode (§7.1, the only one of the
-seven that blocks the import if missing), the original proto
+eight that blocks the import if missing), the original proto
 `package` (§7.2), the exact source file path (§7.3), the file header
-block (§7.4), the comment style (§7.5), `oneof` membership (§7.6), and
-field numbers (§7.7, **strongly recommended**). None of these can be created by script: neither
+block (§7.4), the comment style (§7.5), `oneof` membership (§7.6), field
+numbers (§7.7, **strongly recommended**), and the original layout (§7.8). None of these can be created by script: neither
 Python4Capella nor `capellambse` support it (a deliberate limitation
 of both tools) — it's a one-time manual setup in Capella, via the
 **PV Definition Editor** (select any model element, open the
@@ -451,9 +456,10 @@ markers), and this property records each element's original **style**
 On export, a single-line comment stays at the end of the code line
 (column-aligned), in its original style (`// `, `/// ` or `/* */`); a
 multi-line comment is restored above the element in its style. If
-absent, the export uses `//` everywhere (previous behavior). One known
-gap: inside a boxed comment, padding spaces beyond the longest line are
-not preserved (the `*/` stay aligned with each other).
+absent, the export uses `//` everywhere (previous behavior). Atypical
+styles (`/*` `*/` markers alone on their line, unindented lines, `//`
+without a space…) are restored identically thanks to the raw text stored
+in `Layout` (§7.8).
 
 
 ### 7.6 `oneof` groups (optional)
@@ -491,6 +497,41 @@ imported before this mechanism, export fills in with free numbers, never
 creating duplicates.
 
 
+### 7.8 Original layout (recommended)
+
+| Level | Name | Type |
+|---|---|---|
+| Domain | `Grpc` | — |
+| Group | `Metadata` (same as above) | — |
+| Property (inside Metadata) | `Layout` | String |
+
+Technical content (JSON), not meant to be edited in Capella. It holds
+everything related to the file's presentation, for a **character-exact**
+regeneration:
+
+- **declaration order**, in the file (enums, messages and services
+  interleaved) and inside each message (fields, nested messages, `oneof`);
+- **the file description comment**, and more generally any comment block
+  separated from a declaration by a blank line;
+- **the raw text of comments** whose style a standard rendering cannot
+  reproduce, their position (above or end of line), and the column of
+  end-of-line comments;
+- **blank lines**, the file's **indentation unit** (2 spaces, 4, tab) and
+  **the form of `rpc`s** (`;` or `{}`);
+- **the `syntax` … `package` header** as written, including `option` lines
+  and `import` order;
+- **compact declarations** (`message A { int32 a = 1; }`).
+
+**Robust to edits in Capella**: a comment's raw text is only reused as
+long as the description is unchanged; an edited description is rendered
+in the detected style. Likewise, the original header is only reused if
+the imports and package required by the model are unchanged; otherwise it
+is regenerated, and `option` lines are then lost.
+
+**If absent**, export stays correct (valid file, identical semantics), but
+with normalized formatting.
+
+
 ## 8. Re-importing: update vs duplication
 
 The import is **idempotent**, by name, within each Capella package
@@ -520,8 +561,9 @@ import (pre-existing unrelated content) — expected if your `DataPkg`
 - **Enums nested inside a message**: not handled (Capella does not allow
   an `Enumeration` inside a `Class`); flagged with an `ATTENTION`, fields
   of that type are left untyped.
-- **`reserved` and options** (`[deprecated = true]`, `option java_package`…):
-  not preserved.
-- **Formatting**: the column of end-of-line comments is recomputed,
-  multiple blank lines are normalized, and enums are placed before
-  messages.
+- **`reserved` and field options** (`[deprecated = true]`): not preserved.
+  File-level `option` lines are only preserved while the original header
+  can be reused (§7.8).
+- **One Capella package = one folder**: two files in the same folder
+  cannot define types with the same name, even in different proto
+  packages; the import flags it (§8).

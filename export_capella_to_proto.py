@@ -50,6 +50,7 @@ LIMITES CONNUES (fidelite du round-trip) :
 
 import sys
 import os
+import json
 import posixpath
 import argparse
 import html
@@ -67,6 +68,7 @@ from proto_capella_types import (
     PVMT_COMMENT_STYLE_KEY,
     PVMT_ONEOF_KEY,
     PVMT_FIELD_NUMBER_KEY,
+    PVMT_LAYOUT_KEY,
 )
 
 LAYER_CHOICES = {"oa": "Operational Analysis", "sa": "System Analysis",
@@ -145,50 +147,113 @@ def _description_text(element):
     return html.unescape(text) if text else ""
 
 
-def _as_comment_lines(element, indent=""):
-    """Commentaire place AU-DESSUS d'un element (message, enum, service,
-    rpc), dans son style d'origine."""
-    return proto_comments.render_leading(_description_text(element),
-                                         get_comment_style(element), indent)
+INDENT = "    "  # unite d'indentation, remplacee par celle du fichier d'origine a l'export
+
+
+def _oneline(element, indent, keyword, codes):
+    """Declaration compacte sur une ligne, telle qu'ecrite a l'origine :
+    'message A { int32 a = 1; }', 'message Empty {}'. Commentaire de
+    l'element au-dessus, ou en fin de ligne si c'etait sa position."""
+    lay = get_layout(element)
+    text = _description_text(element)
+    inside = " ".join(c.strip() for c in codes)
+    line = f"{indent}{keyword} {element.name} {{ {inside} }}" if inside else f"{indent}{keyword} {element.name} {{}}"
+    if text and lay.get("pos") == "trailing" and "\n" not in text:
+        raw = lay.get("raw")
+        comment = raw if (raw and proto_comments.text_of_raw_trailing(raw) == text.strip()) \
+            else proto_comments.render_trailing(text, get_comment_style(element))
+        col = lay.get("col")
+        pad = col - len(line) if col and col > len(line) else 1
+        return line + " " * pad + comment
+    return "\n".join(_leading_lines(element, indent) + [line])
+
+
+def get_layout(element):
+    """Mise en forme d'origine (PVMT Layout, JSON), {} si absente."""
+    raw = pvmt_get(element, PVMT_LAYOUT_KEY) if element is not None else None
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _leading_lines(element, indent=""):
+    """Commentaire place AU-DESSUS d'un element : texte BRUT d'origine si
+    la description n'a pas ete modifiee depuis l'import (reproduit tout
+    style atypique a l'identique), sinon rendu dans le style detecte."""
+    text = _description_text(element)
+    if not text:
+        return []
+    lay = get_layout(element)
+    raw = lay.get("raw")
+    if raw and lay.get("pos") == "leading" and \
+            proto_comments.text_of_raw_leading(raw).strip() == text.strip():
+        return proto_comments.reindent(raw, indent)
+    return proto_comments.render_leading(text, get_comment_style(element), indent)
+
+
+_as_comment_lines = _leading_lines  # nom historique, meme comportement
+
+
+def _prefix_lines(element, indent, default_blank):
+    """Lignes vides d'origine avant l'element, puis son eventuel bloc de
+    commentaire DETACHE (ex : presentation du fichier apres les imports)."""
+    if element is None:
+        return [""] * default_blank
+    lay = get_layout(element)
+    out = [""] * lay.get("blank", default_blank)
+    detached = lay.get("detached")
+    if detached:
+        out += proto_comments.reindent(detached, indent)
+        out += [""] * lay.get("dgap", 1)
+    return out
 
 
 def _emit_aligned_block(entries):
-    """entries : liste de (code_line_deja_indentee, element_capella,
-    extra_leading) -- extra_leading est une liste optionnelle de lignes
-    de commentaire toujours affichees en bloc au-dessus (ex : un
-    avertissement "type non resolu"), independamment de la description.
-    Convention observee dans les .proto ecrits a la main (ex:
-    counter.proto) : un commentaire tenant sur UNE ligne est mis en fin
-    de ligne de code, aligne en colonne avec les autres lignes du meme
-    bloc (message/enum) ; un commentaire MULTI-lignes reste en bloc
-    au-dessus. Dans les deux cas, le style d'origine (//, ///, /* */...)
-    est respecte (cf. proto_comments)."""
+    """entries : (code_line_indentee, element_capella, extra_leading[,
+    default_blank]). Commentaire en fin de ligne si c'etait sa position
+    d'origine (ou, a defaut, s'il tient sur une ligne), a sa colonne
+    d'origine si connue, sinon aligne avec les autres lignes du bloc ;
+    commentaire au-dessus sinon. Texte brut d'origine reutilise tant que
+    la description n'a pas change."""
     processed = []
-    for code_line, element, extra_leading in entries:
-        text = _description_text(element)
-        style = get_comment_style(element) if element is not None else proto_comments.DEFAULT_STYLE
+    for entry in entries:
+        code_line, element, extra_leading = entry[:3]
+        default_blank = entry[3] if len(entry) > 3 else 0
         indent = code_line[:len(code_line) - len(code_line.lstrip())]
+        text = _description_text(element)
+        lay = get_layout(element)
         leading = list(extra_leading or [])
-        if not text:
-            processed.append((code_line, None, leading))
-        elif "\n" not in text and not leading:
-            processed.append((code_line, proto_comments.render_trailing(text, style), leading))
-        else:
-            # multi-lignes, ou groupe avec un avertissement : bloc au-dessus
-            leading.extend(proto_comments.render_leading(text, style, indent))
-            processed.append((code_line, None, leading))
+        trailing, col = None, None
+        if text:
+            single = "\n" not in text
+            if single and not leading and lay.get("pos") != "leading":
+                raw = lay.get("raw")
+                if raw and lay.get("pos") == "trailing" and \
+                        proto_comments.text_of_raw_trailing(raw) == text.strip():
+                    trailing = raw
+                else:
+                    trailing = proto_comments.render_trailing(text, get_comment_style(element))
+                col = lay.get("col") if lay.get("pos") == "trailing" else None
+            else:
+                leading.extend(_leading_lines(element, indent))
+        processed.append((code_line, trailing, leading, _prefix_lines(element, indent, default_blank), col))
 
-    trailing_lens = [len(code) for code, trailing, _ in processed if trailing is not None]
-    align_col = max(trailing_lens) + 3 if trailing_lens else 0  # +3 : au moins 2 espaces avant le commentaire
+    auto = [len(c) for c, t, _, _, col in processed if t is not None and col is None]
+    align_col = max(auto) + 3 if auto else 0
 
     lines = []
-    for code_line, trailing, leading in processed:
+    for code_line, trailing, leading, prefix, col in processed:
+        lines.extend(prefix)
         lines.extend(leading)
-        if trailing is not None:
-            pad = " " * (align_col - len(code_line))
-            lines.append(f"{code_line}{pad}{trailing}")
-        else:
+        if trailing is None:
             lines.append(code_line)
+            continue
+        target = col if (col is not None and col > len(code_line)) else align_col
+        target = max(target, len(code_line) + 1)
+        lines.append(code_line + " " * (target - len(code_line)) + trailing)
     return lines
 
 
@@ -240,11 +305,13 @@ def enum_to_proto(enum):
     """Regenere sequentiellement 0..N-1 (cf. limite documentee en tete
     de fichier : Capella ne stocke pas la valeur numerique proto).
     Commentaires courts alignes en fin de ligne (cf. _emit_aligned_block)."""
-    lines = _as_comment_lines(enum)
-    lines.append(f"enum {enum.name} {{")
     literals = list(enum.owned_literals)
     numbers = field_numbers(literals, 0)
-    entries = [(f"    {lit.name} = {numbers[lit.uuid]};", lit, None) for lit in literals]
+    if get_layout(enum).get("oneline") and not any(_description_text(l) for l in literals):
+        return _oneline(enum, "", "enum", [f"{l.name} = {numbers[l.uuid]};" for l in literals])
+    lines = _as_comment_lines(enum)
+    lines.append(f"enum {enum.name} {{")
+    entries = [(f"{INDENT}{lit.name} = {numbers[lit.uuid]};", lit, None) for lit in literals]
     lines.extend(_emit_aligned_block(entries))
     lines.append("}")
     return "\n".join(lines)
@@ -264,8 +331,8 @@ def interface_to_proto_service(interface, needed_imports, type_namer=None):
         if type(op).__name__ != "Service":
             continue  # ignore les autres types de Feature eventuels
 
-        if not first_method:
-            lines.append("")  # ligne vide entre chaque methode, comme dans un .proto ecrit a la main
+        # lignes vides d'origine avant chaque rpc (1 par defaut entre deux rpc)
+        lines.extend(_prefix_lines(op, INDENT, 0 if first_method else 1))
         first_method = False
 
         in_param = next((p for p in op.parameters if str(p.direction) == "IN"), None)
@@ -273,12 +340,12 @@ def interface_to_proto_service(interface, needed_imports, type_namer=None):
 
         in_type = namer(in_param.type) if in_param else None
         if in_type is None:
-            lines.append(f"    // ATTENTION : type d'entree non resolu pour '{op.name}'")
+            lines.append(f"{INDENT}// ATTENTION : type d'entree non resolu pour '{op.name}'")
             in_type = "bytes"
 
         out_type = namer(out_param.type) if out_param else None
         if out_type is None:
-            lines.append(f"    // ATTENTION : type de sortie non resolu pour '{op.name}'")
+            lines.append(f"{INDENT}// ATTENTION : type de sortie non resolu pour '{op.name}'")
             out_type = "bytes"
 
         mode_literal = pvmt_get(op, PVMT_STREAMING_MODE_KEY)
@@ -288,9 +355,10 @@ def interface_to_proto_service(interface, needed_imports, type_namer=None):
 
         in_stream = "stream " if client_streaming else ""
         out_stream = "stream " if server_streaming else ""
-        lines.extend(_as_comment_lines(op, indent="    "))
+        lines.extend(_as_comment_lines(op, indent=INDENT))
         lines.append(
-            f"    rpc {op.name}({in_stream}{in_type}) returns ({out_stream}{out_type});"
+            f"{INDENT}rpc {op.name}({in_stream}{in_type}) returns ({out_stream}{out_type})"
+            + get_layout(op).get("rpc_end", ";")
         )
     lines.append("}")
     return "\n".join(lines)
@@ -538,7 +606,7 @@ def make_type_namer(file_path, file_package, imports):
             return CAPELLA_TO_PROTO_PRIMITIVE.get(capella_type.name, capella_type.name)
         owner_file = get_type_source_file(_top_owner(capella_type))
         if owner_file and owner_file != file_path:
-            imports.add(_import_path(owner_file, file_path))
+            imports.add(owner_file)  # chemin complet ; forme ecrite choisie au rendu
         dotted = _dotted_name(capella_type)
         pkg = _type_package(capella_type)
         if pkg and file_package and pkg != file_package:
@@ -604,60 +672,84 @@ def _is_optional(prop):
 
 
 def class_to_proto_message_v2(cls, namer, indent=""):
-    """Message complet : messages imbriques (hors entrees de map), puis
-    champs -- map<K, V>, optional, repeated, et groupes oneof (PVMT
-    Oneof). Commentaires dans leur style d'origine, fin de ligne alignee."""
-    inner = indent + "    "
-    lines = _as_comment_lines(cls, indent)
+    """Message complet : champs (map<K, V>, optional, repeated), messages
+    imbriques et groupes oneof, DANS L'ORDRE D'ORIGINE (PVMT Layout) ; a
+    defaut, messages imbriques d'abord puis champs. Commentaires, lignes
+    vides et numeros de champ d'origine."""
+    inner = indent + INDENT
+    props = list(cls.owned_properties)
+    numbers = field_numbers(props, 1)
+    map_entries = {e.uuid for e in (_as_map_entry(p, cls) for p in props) if e is not None}
+    nested = [n for n in cls.nested_classes if n.uuid not in map_entries]
+    lines = _leading_lines(cls, indent)
     lines.append(f"{indent}message {cls.name} {{")
 
-    map_entries = {}
-    for prop in cls.owned_properties:
+    def field_line(prop, ind):
+        number = numbers[prop.uuid]
         entry = _as_map_entry(prop, cls)
-        if entry is not None:
-            map_entries[entry.uuid] = entry
-    for nested in cls.nested_classes:
-        if nested.uuid in map_entries:
-            continue  # regenere sous forme map<K, V>, pas comme message
-        lines.append(class_to_proto_message_v2(nested, namer, inner))
-        lines.append("")
-
-    def field_line(prop, number, ind):
-        entry = _as_map_entry(prop, cls)
-        extra = []
         if entry is not None:
             k, v = entry.owned_properties
             kt, vt = namer(k.type, cls) or "string", namer(v.type, cls) or "bytes"
-            return f"{ind}map<{kt}, {vt}> {prop.name} = {number};", extra
+            return f"{ind}map<{kt}, {vt}> {prop.name} = {number};", []
         type_name = namer(prop.type, cls)
+        extra = []
         if type_name is None:
             extra = [f"{ind}// ATTENTION : type non resolu pour ce champ -- verifiez le modele"]
             type_name = "bytes"
         label = "repeated " if is_repeated(prop) else ("optional " if _is_optional(prop) else "")
         return f"{ind}{label}{type_name} {prop.name} = {number};", extra
 
-    pending, emitted_oneofs = [], set()
-    props = list(cls.owned_properties)
-    numbers = field_numbers(props, 1)
-    for prop in props:
-        oneof = _pvmt_str(prop, PVMT_ONEOF_KEY)
+    # forme compacte d'origine, si rien n'impose plusieurs lignes
+    if (get_layout(cls).get("oneline") and not nested
+            and not any(_pvmt_str(p, PVMT_ONEOF_KEY) or _description_text(p) for p in props)):
+        return _oneline(cls, indent, "message", [field_line(p, "")[0] for p in props])
+
+    # elements du corps : (ordre d'origine, rang de repli, nature, objet)
+    items, seen = [], set()
+    for rank, n in enumerate(nested):
+        items.append((get_layout(n).get("order"), rank, "nested", n))
+    for rank, p in enumerate(props, start=len(nested)):
+        oneof = _pvmt_str(p, PVMT_ONEOF_KEY)
         if not oneof:
-            code, extra = field_line(prop, numbers[prop.uuid], inner)
-            pending.append((code, prop, extra))
-            continue
-        if oneof in emitted_oneofs:
-            continue
-        emitted_oneofs.add(oneof)
-        lines.extend(_emit_aligned_block(pending)); pending = []
-        members = [p for p in props if _pvmt_str(p, PVMT_ONEOF_KEY) == oneof]
-        lines.append(f"{inner}oneof {oneof} {{")
-        block = []
-        for m in members:
-            code, extra = field_line(m, numbers[m.uuid], inner + "    ")
-            block.append((code, m, extra))
-        lines.extend(_emit_aligned_block(block))
-        lines.append(f"{inner}}}")
-    lines.extend(_emit_aligned_block(pending))
+            items.append((get_layout(p).get("order"), rank, "field", p))
+        elif oneof not in seen:
+            seen.add(oneof)
+            members = [q for q in props if _pvmt_str(q, PVMT_ONEOF_KEY) == oneof]
+            orders = [get_layout(q).get("order") for q in members]
+            first = min(orders) if all(o is not None for o in orders) else None
+            items.append((first, rank, "oneof", (oneof, members)))
+    if items and all(it[0] is not None for it in items):
+        items.sort(key=lambda it: it[0])
+    else:
+        items.sort(key=lambda it: it[1])
+
+    body, pending, prev = [], [], None
+    def flush():
+        body.extend(_emit_aligned_block(pending))
+        pending.clear()
+    for _, _, kind, obj in items:
+        if kind == "field":
+            code, extra = field_line(obj, inner)
+            pending.append((code, obj, extra, 1 if prev == "nested" else 0))
+        elif kind == "nested":
+            flush()
+            body.extend(_prefix_lines(obj, inner, 1 if prev is not None else 0))
+            body.append(class_to_proto_message_v2(obj, namer, inner))
+        else:
+            flush()
+            name, members = obj
+            if prev is not None and prev != "field":
+                body.append("")
+            body.append(f"{inner}oneof {name} {{")
+            block = []
+            for m in members:
+                code, extra = field_line(m, inner + INDENT)
+                block.append((code, m, extra))
+            body.extend(_emit_aligned_block(block))
+            body.append(f"{inner}}}")
+        prev = kind
+    flush()
+    lines.extend(body)
     lines.append(f"{indent}}}")
     return "\n".join(lines)
 
@@ -693,45 +785,90 @@ def collect_files(model, layer_code=None):
     return files
 
 
-def export_file_to_proto(file_path, content, order="messages-first", package=None):
+def _ordered_imports(imports, file_path, written):
+    """Directives import : celles d'origine d'abord, dans leur ordre et sous
+    leur forme ecrite (PVMT Layout), si elles sont toujours necessaires ;
+    puis les nouvelles (Google d'abord), sous la forme par defaut."""
+    folder = posixpath.dirname(file_path)
+    ordered, used = [], set()
+    for w in written or []:
+        target = w if w in imports else posixpath.join(folder, w)
+        if target in imports and target not in used:
+            ordered.append(w)
+            used.add(target)
+    for t in sorted(imports - used, key=lambda x: (not x.startswith("google/"), x)):
+        ordered.append(t if t.startswith("google/") else _import_path(t, file_path))
+    return ordered
+
+
+def export_file_to_proto(file_path, content, order=None, package=None):
     """Regenere un fichier .proto complet : cartouche, syntax, imports,
-    package, enums, messages, puis services (0, 1 ou plusieurs)."""
-    if order not in ("messages-first", "service-first"):
-        raise ValueError('order doit etre "messages-first" ou "service-first"')
-    elements = content["enums"] + content["classes"] + content["interfaces"]
+    package, puis les declarations (enums, messages, services -- 0, 1 ou
+    plusieurs) DANS L'ORDRE D'ORIGINE si la mise en forme a ete stockee
+    (PVMT Layout), avec le commentaire de presentation du fichier, les
+    commentaires detaches et les lignes vides d'origine.
+    order : None/"original" (defaut : ordre d'origine si connu, sinon
+            messages-first), "messages-first" ou "service-first"."""
+    if order not in (None, "original", "messages-first", "service-first"):
+        raise ValueError('order : "original", "messages-first" ou "service-first"')
+    enums, classes, interfaces = content["enums"], content["classes"], content["interfaces"]
+    elements = enums + classes + interfaces
     if package is None:
         package = next((p for p in (_pvmt_str(e, PVMT_PACKAGE_KEY) for e in elements) if p), None)
     file_header = next((h for h in (_pvmt_str(e, PVMT_HEADER_KEY) for e in elements) if h), None)
 
+    known_order = elements and all(get_layout(e).get("order") is not None for e in elements)
+    if order in (None, "original") and known_order:
+        seq = sorted(elements, key=lambda e: get_layout(e)["order"])
+    elif order == "service-first":
+        seq = interfaces + enums + classes
+    else:
+        seq = enums + classes + interfaces
+
+    global INDENT
+    file_lay = next((get_layout(e) for e in seq if get_layout(e).get("preamble") is not None), {})
+    INDENT = file_lay.get("indent", "    ")
+
     imports = set()
     namer = make_type_namer(file_path, package, imports)
-    type_blocks = []
-    for en in content["enums"]:
-        type_blocks += [enum_to_proto(en), ""]
-    for cls in content["classes"]:
-        type_blocks += [class_to_proto_message_v2(cls, namer), ""]
-    service_blocks = []
-    for iface in content["interfaces"]:
-        service_blocks += [interface_to_proto_service(iface, imports, namer), ""]
+    body = []
+    for e in seq:
+        body.extend(_prefix_lines(e, "", 1))
+        kind = type(e).__name__
+        if kind == "Enumeration":
+            body.append(enum_to_proto(e))
+        elif kind == "Class":
+            body.append(class_to_proto_message_v2(e, namer))
+        else:
+            body.append(interface_to_proto_service(e, imports, namer))
 
+    written = file_lay.get("imports") or next(
+        (get_layout(e).get("imports") for e in seq if get_layout(e).get("imports")), None)
     header = []
     if file_header:
         header.extend(proto_comments.render_header(file_header))
-    header.append('syntax = "proto3";')
-    for imp_path in sorted(imports, key=lambda x: (not x.startswith("google/"), x)):
-        header.append(f'import "{imp_path}";')
-    if package:
-        header.append(f"package {package};")
-    header.append("")
-
-    if order == "messages-first":
-        body = type_blocks + service_blocks
+    import_lines = [f'import "{p}";' for p in _ordered_imports(imports, file_path, written)]
+    preamble = file_lay.get("preamble")
+    if preamble and _preamble_still_valid(preamble, import_lines, package):
+        header.extend(preamble.split("\n"))  # tel qu'ecrit : options, lignes vides, commentaires
     else:
-        body = service_blocks + type_blocks
-    while body and body[-1] == "":
-        body.pop()
+        header.append('syntax = "proto3";')
+        header.extend(import_lines)
+        if package:
+            header.append(f"package {package};")
+    INDENT = "    "
     return "\n".join(header + body) + "\n"
 
+
+def _preamble_still_valid(preamble, import_lines, package):
+    """L'en-tete d'origine (syntax ... package) n'est reutilise tel quel que
+    si ses imports et son package correspondent a ce que le modele exige
+    aujourd'hui ; sinon il est regenere (et les lignes 'option' perdues)."""
+    import re
+    written_imports = re.findall(r'^\s*import\s+(?:public\s+|weak\s+)?"([^"]+)"\s*;', preamble, re.M)
+    needed = [re.search(r'"([^"]+)"', l).group(1) for l in import_lines]
+    m = re.search(r'^\s*package\s+([\w.]+)\s*;', preamble, re.M)
+    return sorted(written_imports) == sorted(needed) and (m.group(1) if m else None) == package
 
 
 def find_interface(model, interface_name, layer_code=None):
@@ -806,10 +943,11 @@ if __name__ == "__main__":
                               "mecanisme). Par defaut non : sinon TOUTES les Interfaces du "
                               "modele, y compris celles sans rapport avec gRPC, seraient "
                               "exportees.")
-    parser.add_argument("--order", default="messages-first",
-                         choices=["messages-first", "service-first"],
-                         help="messages-first (defaut : enums, messages, puis services) ou "
-                              "service-first.")
+    parser.add_argument("--order", default=None,
+                         choices=["original", "messages-first", "service-first"],
+                         help="original (defaut : ordre des declarations du fichier d'origine, "
+                              "si la mise en forme a ete stockee -- sinon messages-first), "
+                              "messages-first (enums, messages, puis services) ou service-first.")
     parser.add_argument("--package", default=None,
                          help="Force le package proto (prioritaire sur le PVMT). En mode --all, "
                               "a laisser vide pour que chaque fichier garde le sien.")
@@ -858,10 +996,16 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"  ECHEC  {src} : {e}")
                 failed.append(src)
+        import re
+        for iface in list(orphans):
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", iface.name):
+                print(f"  IGNORE  '{iface.name}' : nom invalide pour un service proto "
+                      f"(espaces, points...) -- Interface d'architecture, pas gRPC ?")
+                orphans.remove(iface)
         for iface in orphans:
             try:
                 out = compute_output_path(iface, args.output_root)
-                _write(out, export_interface_to_proto(iface, order=args.order, package=args.package))
+                _write(out, export_interface_to_proto(iface, order=args.order if args.order in ("messages-first", "service-first") else "messages-first", package=args.package))
                 print(f"  OK  {iface.name} -> {out}  (sans SourceFile)")
                 exported += 1
             except Exception as e:
@@ -892,5 +1036,5 @@ if __name__ == "__main__":
         print(f"Export termine ({interface.layer.name}) : fichier complet '{src}' -> {out}")
     else:
         out = args.output_path or compute_output_path(interface, args.output_root)
-        _write(out, export_interface_to_proto(interface, order=args.order, package=args.package))
+        _write(out, export_interface_to_proto(interface, order=args.order if args.order in ("messages-first", "service-first") else "messages-first", package=args.package))
         print(f"Export termine ({interface.layer.name}) : {out}  (sans SourceFile, ancien mode)")
